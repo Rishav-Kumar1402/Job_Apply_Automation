@@ -1,0 +1,20 @@
+{
+  "version": "1.0.0",
+  "searchUrl": "https://www.naukri.com/{keywords}-jobs{locationQuery}",
+  "selectors": {
+    "jobCard": ".srp-jobtuple-wrapper, article.jobTuple",
+    "jobTitle": ".title, a.title",
+    "jobCompany": ".comp-name, .subTitle",
+    "applyButton": ".apply-button, button#apply-button, .btn-apply",
+    "externalApply": "text=Apply on company site",
+    "appliedBadge": "text=Applied",
+    "successBanner": "text=Applied successfully, text=successfully applied",
+    "alreadyApplied": "text=already applied",
+    "chatbotModal": ".chatbot_NaukriWBot, .botContainer",
+    "chatbotInput": "input[type='text'], textarea",
+    "chatbotSelect": "select",
+    "chatbotSubmit": "button[type='submit'], .send-btn",
+    "resumeUpload": "input[type='file']",
+    "paginationNext": "a.fright, .styles_btn-secondary__2AsIP"
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "job-autoapply-brevo-relay",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Optional Cloudflare Worker that relays report emails through Brevo",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^4.20.0"
+  }
+}

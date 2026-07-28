@@ -1,0 +1,228 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply antialiased;
+  background: #eef2ff;
+  color: #111827;
+  width: 100%;
+  min-width: 360px;
+  min-height: 100vh;
+  margin: 0;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+input, select, textarea {
+  @apply border rounded-xl px-3 py-2.5 text-sm w-full focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent transition;
+  background: #ffffff;
+  border-color: #d7def0;
+  color: #111827;
+  min-height: 42px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+input[type="checkbox"],
+input[type="radio"] {
+  @apply w-4 h-4 p-0 rounded;
+  min-height: 1rem;
+  box-shadow: none;
+  accent-color: #6d28d9;
+}
+
+input:disabled,
+select:disabled,
+textarea:disabled {
+  background: #f1f5f9;
+  color: #64748b;
+  cursor: not-allowed;
+}
+
+label {
+  @apply block text-xs font-semibold mb-1;
+  color: #475569;
+}
+
+.btn-primary {
+  @apply text-white font-semibold py-2.5 px-4 rounded-xl text-sm transition disabled:opacity-50 disabled:cursor-not-allowed;
+  background: linear-gradient(135deg, #6d28d9, #2563eb);
+  box-shadow: 0 10px 22px rgba(79, 70, 229, 0.24);
+}
+
+.btn-secondary {
+  @apply border font-semibold py-2.5 px-4 rounded-xl text-sm transition disabled:opacity-50 disabled:cursor-not-allowed;
+  background: #ffffff;
+  border-color: #d7def0;
+  color: #334155;
+}
+
+.btn-danger {
+  @apply bg-red-600 hover:bg-red-700 text-white font-semibold py-2.5 px-4 rounded-xl text-sm transition;
+  box-shadow: 0 10px 20px rgba(220, 38, 38, 0.2);
+}
+
+.tab-btn {
+  @apply flex-1 py-3 text-sm font-semibold border-b-2 transition;
+}
+
+.tab-btn-active {
+  @apply border-brand-600 text-brand-600;
+}
+
+.tab-btn-inactive {
+  @apply border-transparent text-gray-500 hover:text-gray-700;
+}
+
+.status-applied { @apply text-green-700 bg-green-50; }
+.status-skipped { @apply text-yellow-800 bg-yellow-50; }
+.status-failed { @apply text-red-700 bg-red-50; }
+.status-searching { @apply text-blue-700 bg-blue-50; }
+
+.app-shell {
+  min-height: 100vh;
+  background: linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%);
+}
+
+.app-header {
+  @apply px-4 py-4 text-white flex items-center justify-between;
+  background: linear-gradient(135deg, #4c1d95, #6d28d9 45%, #2563eb);
+  box-shadow: 0 10px 30px rgba(79, 70, 229, 0.22);
+}
+
+.theme-toggle {
+  @apply text-xs font-semibold rounded-full px-3 py-1.5 border transition;
+  border-color: rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.tab-nav {
+  @apply flex border-b;
+  background: rgba(255, 255, 255, 0.92);
+  border-color: #e2e8f0;
+}
+
+.screen {
+  @apply p-4 overflow-y-auto;
+  height: calc(100vh - 116px);
+  max-height: none;
+  padding-bottom: 4.5rem;
+}
+
+.section-card {
+  @apply rounded-2xl p-4;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid rgba(226, 232, 240, 0.9);
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06);
+}
+
+.hint-card {
+  @apply text-xs rounded-2xl p-3;
+  background: #eef2ff;
+  color: #475569;
+  border: 1px solid #dbeafe;
+}
+
+.alert {
+  @apply text-xs p-3 rounded-2xl border;
+}
+
+.alert-error {
+  @apply bg-red-50 text-red-700 border-red-100;
+}
+
+.text-muted {
+  color: #64748b;
+}
+
+.check-row {
+  @apply flex items-center gap-3 cursor-pointer text-sm font-medium rounded-2xl px-3 py-2.5 border;
+  background: rgba(255, 255, 255, 0.82);
+  border-color: #e2e8f0;
+  color: #334155;
+}
+
+.upload-card {
+  @apply border-2 border-dashed rounded-2xl p-4 text-center transition;
+}
+
+.upload-card-disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.toast {
+  @apply fixed left-4 right-4 top-4 z-50 flex items-center gap-2 rounded-2xl px-4 py-3 text-sm font-semibold shadow-lg;
+}
+
+.toast-info {
+  background: #eef2ff;
+  color: #3730a3;
+  border: 1px solid #c7d2fe;
+}
+
+.toast-warning {
+  background: #fffbeb;
+  color: #92400e;
+  border: 1px solid #fcd34d;
+}
+
+.toast-error {
+  background: #fef2f2;
+  color: #991b1b;
+  border: 1px solid #fecaca;
+}
+
+.spinner {
+  @apply inline-block h-4 w-4 rounded-full border-2;
+  border-color: currentColor;
+  border-right-color: transparent;
+  animation: spin 0.75s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+body.dark {
+  background: #020617;
+  color: #e5e7eb;
+}
+
+body.dark .app-shell {
+  background: linear-gradient(180deg, #020617 0%, #111827 100%);
+}
+
+body.dark .tab-nav,
+body.dark .section-card,
+body.dark .check-row,
+body.dark .btn-secondary {
+  background: rgba(15, 23, 42, 0.92);
+  border-color: #334155;
+  color: #e5e7eb;
+}
+
+body.dark input,
+body.dark select,
+body.dark textarea {
+  background: #0f172a;
+  border-color: #334155;
+  color: #f8fafc;
+}
+
+body.dark input:disabled,
+body.dark select:disabled,
+body.dark textarea:disabled {
+  background: #111827;
+  color: #94a3b8;
+}
+
+body.dark label,
+body.dark .text-muted {
+  color: #cbd5e1;
+}
+
+body.dark .hint-card {
+  background: rgba(30, 41, 59, 0.9);
+  border-color: #334155;
+  color: #cbd5e1;
+}

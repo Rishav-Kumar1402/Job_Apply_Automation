@@ -1,0 +1,28 @@
+{
+  "version": "1.0.0",
+  "searchUrl": "https://www.linkedin.com/jobs/search/?keywords={keywords}&location={location}&f_AL=true&f_TPR={datePosted}",
+  "datePostedMap": {
+    "Past 24h": "r86400",
+    "Past week": "r604800",
+    "Any time": ""
+  },
+  "selectors": {
+    "jobCard": ".job-card-container, .jobs-search-results__list-item, li.jobs-search-results__list-item",
+    "jobTitle": ".job-card-list__title, .artdeco-entity-lockup__title",
+    "jobCompany": ".job-card-container__company-name, .artdeco-entity-lockup__subtitle",
+    "jobIdAttr": "data-job-id",
+    "easyApplyButton": "button.jobs-apply-button, button[aria-label*='Easy Apply']",
+    "externalApplyButton": "button[aria-label*='Apply on company website']",
+    "appliedBadge": ".job-card-container__footer-item, text=Applied",
+    "modal": ".jobs-easy-apply-modal, div[role='dialog']",
+    "modalNext": "button[aria-label='Continue to next step'], button[aria-label='Review your application']",
+    "modalSubmit": "button[aria-label='Submit application']",
+    "modalDismiss": "button[aria-label='Dismiss']",
+    "formField": ".jobs-easy-apply-form-section__grouping",
+    "formInput": "input, select, textarea",
+    "formLabel": "label, .fb-form-element__label",
+    "successToast": ".artdeco-toast-item, text=Application sent",
+    "paginationNext": "button[aria-label='View next page']",
+    "closedJob": "text=no longer accepting applications"
+  }
+}

@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.local
+.DS_Store
+*.log
+.env
+.env.*
+packages/host/data/
+*.db
+*.db-journal
+.turbo/
+coverage/
+*.tsbuildinfo
