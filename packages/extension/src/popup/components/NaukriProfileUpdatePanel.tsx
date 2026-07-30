@@ -24,7 +24,7 @@ export function NaukriProfileUpdatePanel({ profile, onProfileUpdated }: NaukriPr
   const profileRunActive = isRunning && runMode === 'naukri-profile';
   const applyRunActive = isRunning && runMode === 'apply';
 
-  const [open, setOpen] = useState(true);
+  const [open, setOpen] = useState(false);
   const [statusOpen, setStatusOpen] = useState(false);
   const [updateResume, setUpdateResume] = useState(true);
   const [updateHeadline, setUpdateHeadline] = useState(true);

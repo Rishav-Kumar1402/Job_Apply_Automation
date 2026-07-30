@@ -31,7 +31,7 @@ interface ExternalCompanyLead {
   naukriUrl: string;
   externalUrl?: string;
   skipReason?: string;
-  sourceType?: 'company-site' | 'skipped';
+  sourceType?: 'company-site' | 'skipped' | 'applied';
   capturedAt: string;
 }
 
@@ -42,6 +42,10 @@ interface PendingExternalWatch {
   sourceTabId: number;
   candidateUrl?: string;
   createdAt: number;
+  /** Lead already reported — the tab now only holds the run parked until capture finishes. */
+  captured?: boolean;
+  /** Return-to-Naukri already started — prevent double resume. */
+  resumed?: boolean;
 }
 
 let runState: RunState = {
@@ -78,10 +82,13 @@ function scheduleCloseNaukriProfileTab(tabId: number | null, _runId: string | nu
 
 const pendingExternalWatches = new Map<number, PendingExternalWatch>();
 const EXTERNAL_CAPTURE_TIMEOUT_MS = 25000;
-const EXTERNAL_CAPTURE_VISIBLE_MS = 5000;
+/** Brief pause so the company URL settles before the automation closes the tab. */
+const EXTERNAL_CAPTURE_VISIBLE_MS = 3500;
 const CONFIRMATION_WAIT_MS = 6000;
 /** Prevents duplicate auto-emails when multiple frames/paths emit RUN_SUMMARY. */
 const emailedReportRunIds = new Set<string>();
+/** Runs the user explicitly stopped — late content-script events must never revive them. */
+const stoppedRunIds = new Set<string>();
 const emailJsConfig = {
   serviceId: import.meta.env.VITE_EMAILJS_SERVICE_ID as string | undefined,
   templateId: import.meta.env.VITE_EMAILJS_TEMPLATE_ID as string | undefined,
@@ -117,10 +124,17 @@ function toBase64Utf8(text: string): string {
   return btoa(binary);
 }
 
+function leadStatusLabel(lead: ExternalCompanyLead): string {
+  if (lead.sourceType === 'applied') return lead.skipReason || 'Applied';
+  if (lead.sourceType === 'company-site') return lead.skipReason || 'Apply on company site';
+  return lead.skipReason || 'Skipped';
+}
+
 function leadsToHtmlTable(leads: ExternalCompanyLead[]): string {
+  const applied = leads.filter((l) => l.sourceType === 'applied').length;
+  const other = leads.length - applied;
   const rows = leads.map((lead, index) => {
-    const reason = lead.skipReason
-      || (lead.sourceType === 'company-site' ? 'Apply on company site' : 'Skipped');
+    const reason = leadStatusLabel(lead);
     return `<tr>
       <td style="padding:8px;border:1px solid #ddd;">${index + 1}</td>
       <td style="padding:8px;border:1px solid #ddd;">${escapeHtml(lead.company)}</td>
@@ -137,14 +151,14 @@ function leadsToHtmlTable(leads: ExternalCompanyLead[]): string {
 
   return `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#111;">
     <h2>Job Auto-Apply report</h2>
-    <p>Company-site / skipped jobs from the latest run (${leads.length}).</p>
+    <p>${applied} applied, ${other} company-site / skipped (${leads.length} total).</p>
     <table style="border-collapse:collapse;width:100%;font-size:13px;">
       <thead>
         <tr style="background:#f3f4f6;">
           <th style="padding:8px;border:1px solid #ddd;text-align:left;">#</th>
           <th style="padding:8px;border:1px solid #ddd;text-align:left;">Company</th>
           <th style="padding:8px;border:1px solid #ddd;text-align:left;">Job Title</th>
-          <th style="padding:8px;border:1px solid #ddd;text-align:left;">Skip Reason</th>
+          <th style="padding:8px;border:1px solid #ddd;text-align:left;">Status</th>
           <th style="padding:8px;border:1px solid #ddd;text-align:left;">Job Listing URL</th>
           <th style="padding:8px;border:1px solid #ddd;text-align:left;">Company Apply URL</th>
         </tr>
@@ -259,13 +273,73 @@ function attachExternalUrlToPendingTab(tabId: number, url: string | undefined): 
   }
 }
 
+/**
+ * Company-site applies stay sequential: while a company tab is open the Naukri run
+ * stays paused. The automation closes that tab itself after capture, then returns
+ * to the Naukri tab and only then resumes the next job.
+ */
+const externalPauseTabs = new Map<number, PendingExternalWatch>();
+
+function isExternalPauseActive(): boolean {
+  return externalPauseTabs.size > 0;
+}
+
+function parkRunForExternalTab(companyTabId: number, pending: PendingExternalWatch): void {
+  pending.captured = true;
+  externalPauseTabs.set(companyTabId, pending);
+  broadcastAutomationEvent({
+    type: 'STATUS_EVENT',
+    runId: runState.runId,
+    status: 'searching',
+    jobTitle: pending.lead.jobTitle,
+    company: pending.lead.company,
+    reason: 'Company website opened — capturing link, then returning to continue...',
+  });
+}
+
+/** Close the company tab, return to Naukri, then clear the pause so the next job can start. */
+function closeCompanyTabAndReturn(companyTabId: number, pending: PendingExternalWatch): void {
+  parkRunForExternalTab(companyTabId, pending);
+
+  setTimeout(() => {
+    chrome.tabs.remove(companyTabId).then(() => {
+      finishExternalAndResume(pending);
+    }).catch(() => {
+      // Tab already gone — still return to Naukri and continue
+      finishExternalAndResume(pending);
+    });
+  }, EXTERNAL_CAPTURE_VISIBLE_MS);
+}
+
+function finishExternalAndResume(pending: PendingExternalWatch): void {
+  if (pending.resumed) return;
+  pending.resumed = true;
+
+  // Drop every watch for this lead so nothing else can force-resume early
+  clearSiblingWatches(pending);
+  for (const [id, watch] of externalPauseTabs.entries()) {
+    if (watch.runId === pending.runId && externalLeadKey(watch.lead) === externalLeadKey(pending.lead)) {
+      externalPauseTabs.delete(id);
+    }
+  }
+
+  chrome.tabs.sendMessage(pending.sourceTabId, {
+    type: 'EXTERNAL_TAB_CLOSED',
+    payload: { runId: pending.runId },
+  }).catch(() => {});
+
+  returnSourceToSearch(pending);
+}
+
 function resumeAutomationTab(tabId: number, delayMs = 800, force = false): void {
   setTimeout(() => {
     if (!runState.isRunning) return;
+    // Do not resume while a company-site tab is still being handled
+    if (isExternalPauseActive()) return;
     chrome.tabs.sendMessage(tabId, { type: 'RESUME_AUTOMATION', force }).catch(() => {
       if (!runState.isRunning) return;
       setTimeout(() => {
-        if (!runState.isRunning) return;
+        if (!runState.isRunning || isExternalPauseActive()) return;
         chrome.tabs.sendMessage(tabId, { type: 'RESUME_AUTOMATION', force: true }).catch(() => {});
       }, 1500);
     });
@@ -302,6 +376,11 @@ function noteAutomationActivity(): void {
 
 setInterval(() => {
   if (!runState.isRunning || runState.tabId == null) return;
+  // Quiet while a company-site capture is in progress — do not force-resume ahead of it
+  if (isExternalPauseActive()) {
+    noteAutomationActivity();
+    return;
+  }
   // 90s — Easy Apply multi-step forms often go quiet between questions
   if (Date.now() - lastAutomationActivityAt < 90000) return;
   noteAutomationActivity();
@@ -320,39 +399,39 @@ function completeExternalCapture(
   capturedTabId?: number,
   openPreview = false,
 ): void {
-  clearSiblingWatches(pending);
-  addExternalLead({
-    ...pending.lead,
-    externalUrl,
-    capturedAt: new Date().toISOString(),
-  });
+  if (!pending.captured) {
+    addExternalLead({
+      ...pending.lead,
+      externalUrl,
+      capturedAt: new Date().toISOString(),
+    });
+    pending.captured = true;
+  }
 
   if (capturedTabId && capturedTabId !== pending.sourceTabId) {
-    setTimeout(() => {
-      chrome.tabs.remove(capturedTabId).catch(() => {});
-      returnSourceToSearch(pending);
-    }, EXTERNAL_CAPTURE_VISIBLE_MS);
+    closeCompanyTabAndReturn(capturedTabId, pending);
     return;
   }
 
   if (openPreview) {
     chrome.tabs.create({ url: externalUrl, active: true }).then((tab) => {
       if (tab.id) {
-        pendingExternalWatches.set(tab.id, {
+        const preview: PendingExternalWatch = {
           ...pending,
           candidateUrl: externalUrl,
           createdAt: Date.now(),
-        });
-        scheduleExternalWatchTimeout(tab.id);
-        captureExternalTabWhenStable(tab.id);
+          captured: true,
+        };
+        pendingExternalWatches.set(tab.id, preview);
+        closeCompanyTabAndReturn(tab.id, preview);
         return;
       }
-      returnSourceToSearch(pending);
-    }).catch(() => returnSourceToSearch(pending));
+      finishExternalAndResume(pending);
+    }).catch(() => finishExternalAndResume(pending));
     return;
   }
 
-  returnSourceToSearch(pending);
+  finishExternalAndResume(pending);
 }
 
 function completeRecentExternalCapture(url: string, tabId?: number): void {
@@ -419,28 +498,29 @@ function injectWindowOpenHook(tabId: number): Promise<void> {
 
 function scheduleExternalWatchTimeout(tabId: number): void {
   setTimeout(() => {
-    const pending = pendingExternalWatches.get(tabId);
+    const pending = pendingExternalWatches.get(tabId) ?? externalPauseTabs.get(tabId);
     if (!pending) return;
+    // Already closing / returning — leave it alone
+    if (pending.captured && externalPauseTabs.has(tabId)) return;
 
     chrome.tabs.get(tabId).then((tab) => {
       const latestUrl = tab.url;
       if (isExternalCandidateUrl(latestUrl)) pending.candidateUrl = latestUrl;
       if (tabId === pending.sourceTabId) {
-        // Prefer finalizing via company sibling if present
         for (const [id, watch] of pendingExternalWatches.entries()) {
-          if (id !== tabId && externalLeadKey(watch.lead) === externalLeadKey(pending.lead)
-            && isExternalCandidateUrl(watch.candidateUrl)) {
+          if (id !== tabId && externalLeadKey(watch.lead) === externalLeadKey(pending.lead)) {
             finalizeExternalCapture(id);
             return;
           }
         }
-        returnSourceToSearch(pending);
+        // No company tab opened in time — resume on Naukri anyway
+        finishExternalAndResume(pending);
         return;
       }
       finalizeExternalCapture(tabId);
     }).catch(() => {
-      if (tabId === pending.sourceTabId) returnSourceToSearch(pending);
-      else finalizeExternalCapture(tabId);
+      if (tabId === pending.sourceTabId) finishExternalAndResume(pending);
+      else finalizeExternalCapture(tabId, true);
     });
   }, EXTERNAL_CAPTURE_TIMEOUT_MS);
 }
@@ -516,16 +596,33 @@ function addExternalLead(lead: ExternalCompanyLead): void {
     externalUrl: isJobBoardUrl(lead.externalUrl) ? undefined : lead.externalUrl,
     capturedAt: lead.capturedAt || new Date().toISOString(),
   };
-  const key = `${normalized.naukriUrl}|${normalized.company}|${normalized.jobTitle}|${normalized.skipReason ?? ''}`;
-  const existingIndex = runState.externalLeads.findIndex((item) =>
-    `${item.naukriUrl}|${item.company}|${item.jobTitle}|${item.skipReason ?? ''}` === key,
-  );
+  // Deduplicate by listing URL (+ job id) so Mirafra doesn't appear twice with different reasons
+  const jobIdMatch = normalized.naukriUrl.match(/(\d{8,})/);
+  const jobId = jobIdMatch?.[1] ?? '';
+  const sameListing = (item: ExternalCompanyLead) => {
+    if (normalized.naukriUrl && item.naukriUrl && normalized.naukriUrl === item.naukriUrl) return true;
+    if (jobId && (item.naukriUrl || '').includes(jobId)) return true;
+    const sameCompany = (item.company || '').toLowerCase() === (normalized.company || '').toLowerCase();
+    const sameTitle = (item.jobTitle || '').toLowerCase() === (normalized.jobTitle || '').toLowerCase();
+    return Boolean(sameCompany && sameTitle && normalized.company !== 'Unknown');
+  };
+  const existingIndex = runState.externalLeads.findIndex(sameListing);
   if (existingIndex >= 0) {
+    const prev = runState.externalLeads[existingIndex];
+    // Prefer applied > company-site capture > generic skip
+    const rank = (t?: string) => (t === 'applied' ? 3 : t === 'company-site' ? 2 : 1);
+    const preferIncoming = rank(normalized.sourceType) > rank(prev.sourceType)
+      || (normalized.externalUrl && !prev.externalUrl)
+      || (!prev.skipReason && normalized.skipReason);
     runState.externalLeads[existingIndex] = {
-      ...runState.externalLeads[existingIndex],
-      ...normalized,
-      naukriUrl: normalized.naukriUrl || runState.externalLeads[existingIndex].naukriUrl,
-      externalUrl: normalized.externalUrl ?? runState.externalLeads[existingIndex].externalUrl,
+      ...prev,
+      ...(preferIncoming ? normalized : {}),
+      naukriUrl: normalized.naukriUrl || prev.naukriUrl,
+      externalUrl: normalized.externalUrl ?? prev.externalUrl,
+      skipReason: preferIncoming ? (normalized.skipReason ?? prev.skipReason) : (prev.skipReason ?? normalized.skipReason),
+      sourceType: rank(normalized.sourceType) >= rank(prev.sourceType)
+        ? (normalized.sourceType ?? prev.sourceType)
+        : (prev.sourceType ?? normalized.sourceType),
     };
   } else {
     runState.externalLeads.push(normalized);
@@ -542,15 +639,15 @@ function addExternalLead(lead: ExternalCompanyLead): void {
 }
 
 function formatExternalLeadsTable(leads: ExternalCompanyLead[]): string {
-  if (leads.length === 0) return 'No company-site applications were captured.';
+  if (leads.length === 0) return 'No applications were captured.';
   const lines = [
-    'No | Company | Job Title | Skip Reason | Job Listing URL | Company Apply URL',
-    '---|---------|-----------|-------------|-----------------|------------------',
+    'No | Company | Job Title | Status | Job Listing URL | Company Apply URL',
+    '---|---------|-----------|--------|-----------------|------------------',
     ...leads.map((lead, i) => [
       i + 1,
       lead.company,
       lead.jobTitle,
-      lead.skipReason || (lead.sourceType === 'company-site' ? 'Apply on company site' : 'Skipped'),
+      leadStatusLabel(lead),
       lead.naukriUrl,
       lead.externalUrl || 'Not captured',
     ].join(' | ')),
@@ -561,11 +658,11 @@ function formatExternalLeadsTable(leads: ExternalCompanyLead[]): string {
 function leadsToCsv(leads: ExternalCompanyLead[]): string {
   const escape = (value: string | undefined) => `"${(value ?? '').replace(/"/g, '""')}"`;
   return [
-    ['Company', 'Job Title', 'Skip Reason', 'Job Listing URL', 'Company Apply URL', 'Captured At'].map(escape).join(','),
+    ['Company', 'Job Title', 'Status', 'Job Listing URL', 'Company Apply URL', 'Captured At'].map(escape).join(','),
     ...leads.map((lead) => [
       lead.company,
       lead.jobTitle,
-      lead.skipReason || (lead.sourceType === 'company-site' ? 'Apply on company site' : 'Skipped'),
+      leadStatusLabel(lead),
       lead.naukriUrl,
       lead.externalUrl || '',
       lead.capturedAt,
@@ -698,11 +795,13 @@ async function sendCompanySiteEmailReport(
   if (!email) return { ok: false, error: 'Receiver email is empty' };
   if (reportLeads.length === 0) return { ok: false, error: 'No report rows to send' };
 
-  const subject = `Job Auto-Apply company-site report (${reportLeads.length})`;
+  const subject = `Job Auto-Apply report (${reportLeads.length})`;
+  const appliedCount = reportLeads.filter((l) => l.sourceType === 'applied').length;
+  const otherCount = reportLeads.length - appliedCount;
   const textBody = [
     'Hi,',
     '',
-    'Here is the list of company-site applications captured in the latest run.',
+    `Here is the auto-apply report from the latest run (${appliedCount} applied, ${otherCount} company-site / skipped).`,
     '',
     formatExternalLeadsTable(reportLeads),
     '',
@@ -760,13 +859,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: true, ignored: true });
       return true;
     }
-    // If the page is still applying after Stop, re-show Stop so the user can try again
+    // If the page is still applying after an unexpected halt, re-show Stop so the user can try
+    // again — but never for a run the user explicitly stopped, or Stop appears to do nothing.
     if (
       !runState.isRunning
       && payload?.type === 'STATUS_EVENT'
       && payload.status === 'searching'
       && payload.runId
       && payload.runId === runState.runId
+      && !stoppedRunIds.has(payload.runId)
     ) {
       runState.isRunning = true;
     }
@@ -1021,16 +1122,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ ok: false, error: 'No sender tab for option click.' });
       return true;
     }
-    const { preferredLabel, questionHint } = (message.payload ?? {}) as {
+    const { preferredLabel, questionHint, ensureChecked } = (message.payload ?? {}) as {
       preferredLabel?: string;
       questionHint?: string;
+      ensureChecked?: boolean;
     };
 
     const locateOption = () => chrome.scripting.executeScript({
       target: { tabId, allFrames: false },
       world: 'MAIN',
-      args: [preferredLabel || '', questionHint || ''],
-      func: (wantLabel: string, questionHint: string) => {
+      args: [preferredLabel || '', questionHint || '', Boolean(ensureChecked)],
+      func: (wantLabel: string, questionHint: string, ensureChecked: boolean) => {
         const normalize = (s: string) => s.replace(/\s+/g, ' ').trim().toLowerCase();
         const want = normalize(wantLabel);
         const qHint = normalize(questionHint);
@@ -1054,7 +1156,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             const t = (clone.textContent || '').replace(/\s+/g, ' ').trim();
             if (t && t.length <= 60) return t;
           }
-          // Sibling text only — never parent.innerText (pollutes with whole modal)
           const sib = (input ?? el).nextElementSibling;
           if (sib && (sib.textContent || '').trim().length <= 60) {
             return (sib.textContent || '').replace(/\s+/g, ' ').trim();
@@ -1102,57 +1203,59 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           let s = 0;
           if (want && (l === want || l.includes(want) || want.includes(l))) s += 100;
           if (/whitefield|mg road|skip this|yes,? i will|will attend|1\s*[-–]\s*2|2\s*[-–]\s*3/i.test(l)) s += 20;
-          if (/resid|relocat|bengaluru|walk|attend|years of experience/i.test(qHint)) {
-            if (/whitefield|mg road|skip|yes|no|year|experience/i.test(l)) s += 10;
+          if (/^(yes|no)\b/.test(l)) s += 30;
+          if (/^(>=?\s*|>\s*)?\d+(\.\d+)?\+?$/.test(l)) s += 25;
+          if (/resid|relocat|bengaluru|walk|attend|years of experience|fullstack|full stack/i.test(qHint)) {
+            if (/whitefield|mg road|skip|yes|no|year|experience|^\d|>=|>/.test(l)) s += 15;
           }
+          if (want && /^\d/.test(want) && l === want) s += 50;
           return s;
         };
 
         opts.sort((a, b) => score(b) - score(a));
-        const best = opts[0];
-        if (score(best) <= 0 && want) {
-          // Still try first matching keyword from want
-          const soft = opts.find((o) => normalize(o.label).includes(want.split(' ')[0]));
-          if (soft) opts.unshift(soft);
-        }
         const pick = opts[0];
         const target = pick.el;
         const input = pick.input;
 
+        // Avoid toggle-off: if already checked and ensureChecked, do nothing extra
+        if (ensureChecked && input?.checked) {
+          return {
+            clicked: true,
+            label: pick.label,
+            checked: true,
+            count: opts.length,
+            skippedToggle: true,
+          };
+        }
+
         if (input) {
+          if (!input.checked) {
+            input.click();
+          }
+          if (!input.checked) {
+            input.checked = true;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            target.click();
+          }
+        } else {
+          target.click();
+        }
+
+        if (input && !input.checked) {
           input.checked = true;
-          input.dispatchEvent(new Event('click', { bubbles: true }));
-          input.dispatchEvent(new Event('input', { bubbles: true }));
           input.dispatchEvent(new Event('change', { bubbles: true }));
         }
-        target.scrollIntoView({ block: 'center', behavior: 'instant' });
-        target.click();
+
         const rect = target.getBoundingClientRect();
         const x = Math.round(rect.left + rect.width / 2);
         const y = Math.round(rect.top + rect.height / 2);
-        const optsEvt: MouseEventInit = {
-          bubbles: true,
-          cancelable: true,
-          view: window,
-          composed: true,
-          clientX: x,
-          clientY: y,
-          button: 0,
-          buttons: 1,
-        };
-        target.dispatchEvent(new MouseEvent('mousedown', optsEvt));
-        target.dispatchEvent(new MouseEvent('mouseup', optsEvt));
-        target.dispatchEvent(new MouseEvent('click', optsEvt));
-        if (input) {
-          input.checked = true;
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-        }
         return {
           clicked: true,
           label: pick.label,
           x,
           y,
-          checked: Boolean(input?.checked),
+          checked: Boolean(input?.checked ?? true),
           count: opts.length,
         };
       },
@@ -1189,9 +1292,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           y?: number;
           count?: number;
           checked?: boolean;
+          skippedToggle?: boolean;
         } | undefined;
-        if (!info?.clicked || typeof info.x !== 'number' || typeof info.y !== 'number') {
+        if (!info?.clicked) {
           sendResponse({ ok: true, clicked: false, info });
+          return;
+        }
+        // Do NOT CDP-click again if already checked — a second click toggles checkboxes OFF
+        if (info.checked || info.skippedToggle || typeof info.x !== 'number' || typeof info.y !== 'number') {
+          sendResponse({
+            ok: true,
+            clicked: true,
+            trusted: false,
+            label: info.label,
+            count: info.count,
+            checked: info.checked,
+          });
           return;
         }
         const trusted = await trustedClickAt(info.x, info.y);
@@ -1253,12 +1369,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
         }
 
+        // Naukri's job-alert / "send me jobs like this" / profile widgets are not the chat
+        const promoRe = /job alert|jobs like this|get job alerts|similar jobs|subscribe|newsletter|search jobs here|upgrade to naukri pro|view (?:&|and) update profile|search appearances|log ?out/i;
+        const isPromoWidget = (el: HTMLElement): boolean => {
+          if (el.closest('[class*="NaukriWBot" i], [class*="chatbot" i], [class*="botContainer" i]')) return false;
+          const own = [
+            (el as HTMLInputElement).placeholder,
+            el.getAttribute('aria-label'),
+            el.getAttribute('name'),
+            el.id,
+          ].filter(Boolean).join(' ');
+          if (promoRe.test(own)) return true;
+          const host = el.closest('form, section, aside, [role="dialog"], div') as HTMLElement | null;
+          return promoRe.test((host?.innerText || '').replace(/\s+/g, ' ').slice(0, 400));
+        };
+
         const pickInput = (): HTMLElement | null => {
           const nodes = Array.from(document.querySelectorAll<HTMLElement>(
             'input[type="text"], input:not([type]), input[type="search"], textarea, [contenteditable="true"], [contenteditable=""]',
           ));
           for (const el of nodes) {
             if (!isVisible(el)) continue;
+            if (isPromoWidget(el)) continue;
             const ph = ((el as HTMLInputElement).placeholder || '').toLowerCase();
             const aria = (el.getAttribute('aria-label') || '').toLowerCase();
             const dataPh = (el.getAttribute('data-placeholder') || '').toLowerCase();
@@ -1278,6 +1410,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             if (!isVisible(container)) continue;
             // Skip containers that are option forms
             if (container.querySelector('input[type="radio"], input[type="checkbox"]')) continue;
+            if (promoRe.test(container.textContent || '')) continue;
             const text = (container.textContent || '').toLowerCase();
             if (!(
               text.includes('type message')
@@ -1623,8 +1756,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     void chrome.storage.local.set({ 'job-autoapply-force-stop': Date.now() });
     clearNaukriProfileTabCloseTimer();
     runState.isRunning = false;
+    if (runState.runId) stoppedRunIds.add(runState.runId);
     startedTabIds.clear();
     pendingExternalWatches.clear();
+    externalPauseTabs.clear();
 
     const stopInTab = async (tabId: number): Promise<void> => {
       try {
@@ -1851,48 +1986,56 @@ chrome.tabs.onCreated.addListener((tab) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  externalPauseTabs.delete(tabId);
+
   const pending = pendingExternalWatches.get(tabId);
   if (!pending) return;
   if (tabId === pending.sourceTabId) {
     pendingExternalWatches.delete(tabId);
+    externalPauseTabs.clear();
     return;
   }
-  finalizeExternalCapture(tabId);
+  // Company tab closed — bookkeeping only. closeCompanyTabAndReturn / finishExternalAndResume
+  // owns returning to Naukri and resuming so we never advance while the tab is still open.
+  pendingExternalWatches.delete(tabId);
+  if (!pending.captured && isExternalCandidateUrl(pending.candidateUrl)) {
+    addExternalLead({
+      ...pending.lead,
+      externalUrl: pending.candidateUrl,
+      capturedAt: new Date().toISOString(),
+    });
+    pending.captured = true;
+  }
 });
 
-function finalizeExternalCapture(capturedTabId: number): void {
-  const pending = pendingExternalWatches.get(capturedTabId);
+function finalizeExternalCapture(capturedTabId: number, tabClosed = false): void {
+  const pending = pendingExternalWatches.get(capturedTabId) ?? externalPauseTabs.get(capturedTabId);
   if (!pending) return;
 
   const externalUrl = isExternalCandidateUrl(pending.candidateUrl) ? pending.candidateUrl : undefined;
-  if (!externalUrl && hasSiblingWatch(capturedTabId, pending)) {
-    // Source/confirmation finished first — keep waiting on company tab
+  if (!externalUrl && !tabClosed && hasSiblingWatch(capturedTabId, pending)) {
     if (capturedTabId === pending.sourceTabId) {
       pendingExternalWatches.delete(capturedTabId);
     }
     return;
   }
 
-  if (externalUrl) clearSiblingWatches(pending);
-  else pendingExternalWatches.delete(capturedTabId);
-
-  addExternalLead({
-    ...pending.lead,
-    externalUrl,
-    capturedAt: new Date().toISOString(),
-  });
-
-  if (capturedTabId !== pending.sourceTabId) {
-    if (externalUrl) {
-      setTimeout(() => {
-        chrome.tabs.remove(capturedTabId).catch(() => {});
-        returnSourceToSearch(pending);
-      }, EXTERNAL_CAPTURE_VISIBLE_MS);
-      return;
-    }
-    chrome.tabs.remove(capturedTabId).catch(() => {});
+  if (!pending.captured) {
+    addExternalLead({
+      ...pending.lead,
+      externalUrl,
+      capturedAt: new Date().toISOString(),
+    });
+    pending.captured = true;
   }
-  returnSourceToSearch(pending);
+
+  if (capturedTabId !== pending.sourceTabId && !tabClosed) {
+    // Automation closes the company tab, then returns to Naukri and resumes
+    closeCompanyTabAndReturn(capturedTabId, pending);
+    return;
+  }
+
+  finishExternalAndResume(pending);
 }
 
 async function startNaukriProfileUpdate(payload: {
@@ -2016,6 +2159,7 @@ async function startAutomation(profile: Profile, criteria: SearchCriteria): Prom
     externalLeads: [],
   };
   emailedReportRunIds.clear();
+  stoppedRunIds.clear();
 
   const tab = await chrome.tabs.create({ url: searchUrl, active: true });
   if (!tab.id) return false;

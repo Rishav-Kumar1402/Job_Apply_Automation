@@ -164,6 +164,10 @@ export function Popup() {
             type="button"
             className="btn-danger w-full text-sm"
             onClick={() => {
+              // Reset immediately — waiting for the response let a late status event
+              // flip the UI back to "Running" before the callback arrived
+              setRunning(false);
+              setRunMode('idle');
               chrome.runtime.sendMessage({ type: 'STOP_APPLY' }, () => {
                 setRunning(false);
                 setRunMode('idle');

@@ -23,12 +23,19 @@ function listingUrlLabel(url: string | undefined): string {
 }
 
 function externalLeadsToCsv(leads: ExternalCompanyLead[]): string {
+  const statusOf = (lead: ExternalCompanyLead) =>
+    lead.skipReason
+    ?? (lead.sourceType === 'applied'
+      ? 'Applied'
+      : lead.sourceType === 'company-site'
+        ? 'Apply on company site'
+        : 'Skipped');
   return [
-    ['Company', 'Job Title', 'Skip Reason', 'Job Listing URL', 'Company Apply URL', 'Captured At'].map(csvEscape).join(','),
+    ['Company', 'Job Title', 'Status', 'Job Listing URL', 'Company Apply URL', 'Captured At'].map(csvEscape).join(','),
     ...leads.map((lead) => [
       lead.company,
       lead.jobTitle,
-      lead.skipReason ?? (lead.sourceType === 'company-site' ? 'Apply on company site' : 'Skipped'),
+      statusOf(lead),
       lead.naukriUrl,
       lead.externalUrl ?? '',
       lead.capturedAt,
@@ -84,7 +91,16 @@ export function RunDashboardTab() {
       };
 
       const currentRunId = useAppStore.getState().runId;
-      if (payload.runId && currentRunId && payload.runId !== currentRunId) return;
+      // RUN_STARTED always carries a new runId — it must never be filtered out as "stale",
+      // otherwise the previous run's counters and report stay on screen.
+      if (
+        payload.type !== 'RUN_STARTED'
+        && payload.runId
+        && currentRunId
+        && payload.runId !== currentRunId
+      ) {
+        return;
+      }
 
       if (payload.type === 'RUN_STARTED' && payload.runId) {
         // Fresh run — wipe previous counters / report so UI does not retain old numbers
@@ -181,6 +197,11 @@ export function RunDashboardTab() {
     const hydrate = () => {
       chrome.runtime.sendMessage({ type: 'GET_RUN_STATE' }, (state) => {
         if (chrome.runtime.lastError) return;
+        // A different runId means a newer run — drop everything from the old one first
+        const knownRunId = useAppStore.getState().runId;
+        if (state?.runId && knownRunId && state.runId !== knownRunId) {
+          resetRun();
+        }
         if (state?.runId) setRunId(state.runId);
         if (state?.isRunning !== undefined) setRunning(Boolean(state.isRunning));
         if (state?.isRunning) {
@@ -229,12 +250,13 @@ export function RunDashboardTab() {
     { applied: 0, skipped: 0, failed: 0 },
   );
 
-  // Prefer content-script counters. Skipped never shows less than report rows.
+  // Prefer content-script counters. Skipped never shows less than non-applied report rows.
+  const reportSkippedRows = externalLeads.filter((l) => l.sourceType !== 'applied').length;
   const displayCounts = {
     applied: runSummary?.applied ?? liveCounters?.applied ?? countsFromEvents.applied,
     skipped: Math.max(
       runSummary?.skipped ?? liveCounters?.skipped ?? countsFromEvents.skipped,
-      externalLeads.length,
+      reportSkippedRows,
     ),
     failed: runSummary?.failed ?? liveCounters?.failed ?? countsFromEvents.failed,
   };
@@ -346,8 +368,12 @@ export function RunDashboardTab() {
         <div className="section-card space-y-3">
           <div className="flex items-center justify-between gap-2">
             <div>
-              <h3 className="text-sm font-semibold">Company-site Apply Report</h3>
-              <p className="text-xs text-muted">{externalLeads.length} skipped jobs captured</p>
+              <h3 className="text-sm font-semibold">Application Report</h3>
+              <p className="text-xs text-muted">
+                {externalLeads.filter((l) => l.sourceType === 'applied').length} applied
+                {' · '}
+                {externalLeads.filter((l) => l.sourceType !== 'applied').length} company-site / skipped
+              </p>
             </div>
             <div className="flex gap-2">
               <button className="btn-secondary py-1.5 px-2 text-xs" onClick={handleDownloadCsv}>
@@ -364,7 +390,7 @@ export function RunDashboardTab() {
                 <tr className="text-left text-muted">
                   <th className="py-1 pr-2">Company</th>
                   <th className="py-1 pr-2">Role</th>
-                  <th className="py-1 pr-2">Reason</th>
+                  <th className="py-1 pr-2">Status</th>
                   <th className="py-1">URL</th>
                 </tr>
               </thead>
@@ -373,7 +399,14 @@ export function RunDashboardTab() {
                   <tr key={`${lead.company}-${lead.jobTitle}-${index}`} className="border-t border-slate-200">
                     <td className="py-2 pr-2 font-medium">{lead.company}</td>
                     <td className="py-2 pr-2">{lead.jobTitle}</td>
-                    <td className="py-2 pr-2">{lead.skipReason ?? 'Skipped'}</td>
+                    <td className="py-2 pr-2">
+                      {lead.skipReason
+                        ?? (lead.sourceType === 'applied'
+                          ? 'Applied'
+                          : lead.sourceType === 'company-site'
+                            ? 'Apply on company site'
+                            : 'Skipped')}
+                    </td>
                     <td className="py-2">
                       {lead.externalUrl ? (
                         <a

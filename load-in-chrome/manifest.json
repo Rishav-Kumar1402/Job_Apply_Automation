@@ -50,7 +50,7 @@
   "content_scripts": [
     {
       "js": [
-        "assets/automation.ts-C8CjCoH1.js"
+        "assets/automation.ts-AnmKraUb.js"
       ],
       "matches": [
         "https://www.linkedin.com/*",
@@ -76,7 +76,7 @@
         "https://www.naukri.com/*"
       ],
       "resources": [
-        "assets/automation.ts-C8CjCoH1.js"
+        "assets/automation.ts-AnmKraUb.js"
       ],
       "use_dynamic_url": false
     }

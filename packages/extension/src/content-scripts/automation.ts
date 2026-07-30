@@ -497,7 +497,7 @@ interface ExternalCompanyLead {
   naukriUrl: string;
   externalUrl?: string;
   skipReason?: string;
-  sourceType?: 'company-site' | 'skipped';
+  sourceType?: 'company-site' | 'skipped' | 'applied';
   capturedAt: string;
 }
 
@@ -558,11 +558,45 @@ function markJobProcessed(state: NaukriRunState, detailUrl: string | undefined |
   }
 }
 
+/** How many times a posting may be reopened before the run gives up on it. */
+const NAUKRI_MAX_JOB_OPENS = 6;
+
 function noteNaukriDetailAttempt(url: string): number {
   const key = `job-autoapply-open-count-${normalizeJobUrl(url)}`;
   const next = Number(sessionStorage.getItem(key) || '0') + 1;
   sessionStorage.setItem(key, String(next));
   return next;
+}
+
+function externalPauseKey(runId?: string | null): string {
+  return `job-autoapply-external-tab-open-${runId || currentRunId || 'none'}`;
+}
+
+/** Safety net: a lost "tab closed" message must not park the run forever. */
+const EXTERNAL_PAUSE_MAX_MS = 15 * 60 * 1000;
+
+/** Company-site tab is open: the run must stay parked until the user closes that tab. */
+function isExternalPauseActive(runId?: string | null): boolean {
+  const ids = [runId, currentRunId, loadNaukriState()?.runId].filter(Boolean) as string[];
+  return ids.some((id) => {
+    const value = sessionStorage.getItem(externalPauseKey(id));
+    if (!value) return false;
+    const startedAt = Number(value);
+    if (Number.isFinite(startedAt) && startedAt > 0 && Date.now() - startedAt > EXTERNAL_PAUSE_MAX_MS) {
+      sessionStorage.removeItem(externalPauseKey(id));
+      return false;
+    }
+    return true;
+  });
+}
+
+function setExternalPause(runId: string): void {
+  sessionStorage.setItem(externalPauseKey(runId), String(Date.now()));
+}
+
+function clearExternalPause(runId?: string | null): void {
+  const ids = [runId, currentRunId, loadNaukriState()?.runId].filter(Boolean) as string[];
+  for (const id of ids) sessionStorage.removeItem(externalPauseKey(id));
 }
 
 function countNaukriRateLimits(state: NaukriRunState): number {
@@ -607,32 +641,41 @@ function skipNaukriJobAndAdvance(
   detailUrl?: string | null,
 ): void {
   const listingUrl = resolveNaukriListingUrl(detailUrl || state.currentDetailUrl || window.location.href);
+  const alreadyHandled = isNaukriJobHandled(state, listingUrl, state.jobTitle, state.company)
+    || isNaukriJobHandled(state, detailUrl, state.jobTitle, state.company);
+
   markJobProcessed(state, listingUrl);
   markJobProcessed(state, state.currentDetailUrl);
   markJobProcessed(state, detailUrl);
-  // Force open-count high so list will not reopen this URL even if processed match fails
-  const openKey = `job-autoapply-open-count-${normalizeJobUrl(state.currentDetailUrl || listingUrl)}`;
-  sessionStorage.setItem(openKey, '99');
-
-  state.counts.skipped++;
-  const isRateLimit = /rate limit/i.test(reason);
-  if (isRateLimit) {
-    countNaukriRateLimits(state);
-  } else {
-    clearNaukriConsecutiveRateLimits(state);
+  const skipUrl = normalizeJobUrl(state.currentDetailUrl || listingUrl || '');
+  if (skipUrl) {
+    sessionStorage.setItem(`job-autoapply-open-count-${skipUrl}`, String(NAUKRI_MAX_JOB_OPENS));
+    sessionStorage.setItem(`job-autoapply-skip-recorded-${normalizeJobUrl(listingUrl || skipUrl)}`, '1');
   }
-  recordSkippedLead(state.jobTitle, state.company, reason, listingUrl);
-  emit({
-    status: 'skipped',
-    jobTitle: state.jobTitle,
-    company: state.company,
-    reason,
-  });
+
+  if (!alreadyHandled) {
+    state.counts.skipped++;
+    const isRateLimit = /rate limit/i.test(reason);
+    if (isRateLimit) {
+      countNaukriRateLimits(state);
+    } else {
+      clearNaukriConsecutiveRateLimits(state);
+    }
+    recordSkippedLead(state.jobTitle, state.company, reason, listingUrl);
+    emit({
+      status: 'skipped',
+      jobTitle: state.jobTitle,
+      company: state.company,
+      reason,
+    });
+  }
+
   sessionStorage.removeItem(`job-autoapply-post-apply-${state.runId}`);
   releasePageClaim();
   sessionStorage.removeItem(EXEC_KEY);
 
   // Stop early on sustained rate limiting (2 in a row, or 3 total this run)
+  const isRateLimit = /rate limit/i.test(reason);
   if (
     isRateLimit
     && ((state.consecutiveRateLimits ?? 0) >= 2 || (state.rateLimitHits ?? 0) >= 3)
@@ -645,14 +688,45 @@ function skipNaukriJobAndAdvance(
   returnToNaukriSearch(state, state.jobIndex + 1);
 }
 
-/** Prefer a real job-listings URL even if the page redirected after an Apply error. */
+/** Post-apply / redirect pages (saveApply, showAcp, myapply) are useless as report links. */
+function isNaukriPostApplyUrl(url: string): boolean {
+  return /naukri\.com\/(myapply|saveapply|showacp)/i.test(url)
+    || /\/(saveapply|showacp)\b/i.test(url);
+}
+
+/** Job id carried by post-apply URLs (strJobsarr=[id] or the multiApplyResp key). */
+function naukriJobIdFromApplyUrl(url: string): string | null {
+  const fromList = url.match(/strJobsarr=\[?(\d{8,})/i)?.[1];
+  if (fromList) return fromList;
+  const fromResp = url.match(/multiApplyResp=[^&]*?(\d{8,})/i)?.[1];
+  return fromResp ?? null;
+}
+
+/** Job title Naukri appends to saveApply URLs — used when run state lost the title. */
+function naukriJobTitleFromApplyUrl(url: string): string | null {
+  const raw = url.match(/[?&]jobTitle=([^&]+)/i)?.[1];
+  if (!raw) return null;
+  try {
+    const decoded = decodeURIComponent(raw.replace(/\+/g, ' ')).trim();
+    return decoded.length >= 3 ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Listing URL for the report. Returns '' when only post-apply URLs are available. */
 function resolveNaukriListingUrl(preferred?: string | null): string {
-  const fromState = loadNaukriState()?.currentDetailUrl;
+  const state = loadNaukriState();
+  const fromState = state?.currentDetailUrl;
   const canonical = (document.querySelector('link[rel="canonical"]') as HTMLLinkElement | null)?.href;
   const ogUrl = (document.querySelector('meta[property="og:url"]') as HTMLMetaElement | null)?.content;
-  const candidates = [preferred, fromState, window.location.href, canonical, ogUrl]
+  const rawCandidates = [preferred, fromState, window.location.href, canonical, ogUrl]
     .filter((u): u is string => Boolean(u && u.trim()))
-    .map((u) => normalizeJobUrl(u.trim()));
+    .map((u) => u.trim());
+
+  const candidates = rawCandidates
+    .map((u) => normalizeJobUrl(u))
+    .filter((u) => !isNaukriPostApplyUrl(u));
 
   const isListing = (u: string) =>
     /job-listings|job-details|\/job\//i.test(u)
@@ -661,6 +735,14 @@ function resolveNaukriListingUrl(preferred?: string | null): string {
   for (const u of candidates) {
     if (isListing(u)) return u;
   }
+
+  // On a saveApply/showAcp page: recover the real posting from the job id we already visited
+  const applyJobId = rawCandidates.map(naukriJobIdFromApplyUrl).find(Boolean);
+  if (applyJobId) {
+    const known = (state?.processedDetailUrls ?? []).find((u) => u.includes(applyJobId));
+    if (known) return known;
+  }
+
   for (const u of candidates) {
     if (
       u.includes('naukri.com')
@@ -671,18 +753,19 @@ function resolveNaukriListingUrl(preferred?: string | null): string {
       return u;
     }
   }
-  return candidates[0] ?? normalizeJobUrl(window.location.href);
+  return candidates[0] ?? '';
 }
 
 function recordExternalApplyLead(lead: ExternalCompanyLead): void {
   const naukriUrl = resolveNaukriListingUrl(lead.naukriUrl);
+  const fallback = isNaukriPostApplyUrl(lead.naukriUrl || '') ? '' : lead.naukriUrl;
   safeRuntimeSend({
     type: 'RECORD_EXTERNAL_APPLY_LEAD',
     payload: {
       runId: currentRunId,
       lead: {
         ...lead,
-        naukriUrl: naukriUrl || lead.naukriUrl || window.location.href,
+        naukriUrl: naukriUrl || fallback || 'Not captured',
       },
     },
   });
@@ -694,13 +777,52 @@ function recordSkippedLead(
   reason: string,
   naukriUrl?: string,
 ): void {
-  const listingUrl = resolveNaukriListingUrl(naukriUrl ?? loadNaukriState()?.currentDetailUrl ?? window.location.href);
+  const state = loadNaukriState();
+  const listingUrl = resolveNaukriListingUrl(naukriUrl ?? state?.currentDetailUrl ?? window.location.href);
+  const title = jobTitle
+    ?? state?.jobTitle
+    ?? naukriJobTitleFromApplyUrl(window.location.href)
+    ?? undefined;
+  const org = company ?? state?.company ?? undefined;
+
+  // A row with no job, no company and no listing link is only noise in the report
+  if (!listingUrl && !title && !org) {
+    emit({ status: 'searching', reason: `Skip not reported (job could not be identified): ${reason}` });
+    return;
+  }
+
   recordExternalApplyLead({
-    jobTitle: jobTitle ?? 'Unknown',
-    company: company ?? 'Unknown',
+    jobTitle: title ?? 'Unknown',
+    company: org ?? 'Unknown',
     naukriUrl: listingUrl,
     skipReason: reason,
     sourceType: 'skipped',
+    capturedAt: new Date().toISOString(),
+  });
+}
+
+function recordAppliedLead(
+  jobTitle: string | undefined,
+  company: string | undefined,
+  naukriUrl?: string,
+): void {
+  const state = loadNaukriState();
+  const listingUrl = resolveNaukriListingUrl(
+    naukriUrl ?? state?.currentDetailUrl ?? window.location.href,
+  );
+  const title = jobTitle
+    ?? state?.jobTitle
+    ?? naukriJobTitleFromApplyUrl(window.location.href)
+    ?? undefined;
+  const org = company ?? state?.company ?? undefined;
+  if (!listingUrl && !title && !org) return;
+
+  recordExternalApplyLead({
+    jobTitle: title ?? 'Unknown',
+    company: org ?? 'Unknown',
+    naukriUrl: listingUrl || window.location.href,
+    skipReason: 'Applied',
+    sourceType: 'applied',
     capturedAt: new Date().toISOString(),
   });
 }
@@ -844,6 +966,10 @@ function startStallWatchdog(): void {
       return;
     }
     if (!automationActive || isStopped()) return;
+    if (isExternalPauseActive()) {
+      lastProgressAt = Date.now();
+      return;
+    }
     if (Date.now() - lastProgressAt < 90000) return;
 
     lastProgressAt = Date.now();
@@ -1071,6 +1197,9 @@ async function captureNaukriCompanySiteApply(
     reason: 'Clicking Apply on company site...',
   });
 
+  // Park the run before the tab opens — a fast capture must not race ahead to the next job
+  setExternalPause(state.runId);
+
   await handleCompanySiteApply(
     state.runId,
     naukriSearchUrlFor(state),
@@ -1082,8 +1211,18 @@ async function captureNaukriCompanySiteApply(
   if (!control && !isUsableNavigationUrl(externalHref)) {
     recordExternalApplyLead(lead);
     sessionStorage.removeItem(`job-autoapply-external-pending-${state.runId}`);
+    clearExternalPause(state.runId);
     window.location.href = naukriSearchUrlFor(state);
+    return;
   }
+
+  // Stay parked until the background closes the company tab and returns here
+  emit({
+    status: 'searching',
+    jobTitle,
+    company,
+    reason: 'Company website opened — waiting to capture link and return before next job...',
+  });
 }
 
 function isNaukriErrorPage(): boolean {
@@ -1177,6 +1316,8 @@ function clearNaukriAttemptCounters(): void {
       || key.startsWith('job-autoapply-page-click-')
       || key.startsWith('job-autoapply-list-reload-')
       || key.startsWith('job-autoapply-filter-relax-')
+      || key.startsWith('job-autoapply-skip-recorded-')
+      || key.startsWith('job-autoapply-external-tab-open-')
     ) {
       toRemove.push(key);
     }
@@ -1197,6 +1338,7 @@ function haltAutomationLocally(): void {
   sessionStorage.removeItem(EXEC_KEY);
   sessionStorage.removeItem(HANDLED_KEY);
   sessionStorage.removeItem('job-autoapply-naukri-profile-update');
+  clearExternalPause();
   automationActive = false;
 }
 
@@ -1533,6 +1675,9 @@ async function clickNaukriApplyViaMainWorld(): Promise<boolean> {
 type ApplyClickResult = 'worked' | 'site-error' | 'failed';
 
 function dismissBlockingNaukriOverlaysBeforeApply(): void {
+  // Recruiter chat already open — nothing here may run, every click would close it
+  if (isNaukriChatOpen()) return;
+
   // Cookie / consent bars
   document.querySelectorAll<HTMLElement>(
     'button, a, [role="button"]',
@@ -1560,11 +1705,28 @@ function dismissBlockingNaukriOverlaysBeforeApply(): void {
   }
 }
 
+/** Naukri pages that are not a job posting — retrying Apply there can only fail. */
+function isOffJobPostingPage(): boolean {
+  const url = window.location.href.toLowerCase();
+  return /\/(jobalert|alerts?|mnjuser|myapply\/alert|recruiter|companies|services)\b/.test(url)
+    || /createjobalert|job-alert/.test(url);
+}
+
 async function clickNaukriApplyButton(btn: HTMLElement): Promise<ApplyClickResult> {
   if (detectNaukriSiteError()) return 'site-error';
+  if (isOffJobPostingPage()) {
+    emit({ status: 'searching', reason: 'Not on the job posting — skipping Apply clicks' });
+    return 'failed';
+  }
+
+  // Chat already open — clicking Apply behind it closes the chat and loses the answers
+  if (isNaukriChatOpen()) {
+    emit({ status: 'searching', reason: 'Questions already open — not re-clicking Apply' });
+    return 'worked';
+  }
 
   dismissBlockingNaukriOverlaysBeforeApply();
-  await sleep(300);
+  await sleep(600);
 
   // Prefer MAIN-world + CDP trusted click first — isolated-world clicks often never apply
   emit({ status: 'searching', reason: 'Clicking Apply (page + trusted click)...' });
@@ -1576,6 +1738,7 @@ async function clickNaukriApplyButton(btn: HTMLElement): Promise<ApplyClickResul
   // Isolated-world retries as backup
   for (let attempt = 0; attempt < 3 && !isStopped(); attempt++) {
     if (detectNaukriSiteError()) return 'site-error';
+    if (isOffJobPostingPage()) return 'failed';
 
     const fresh = findNaukriApplyButtonSync() ?? btn;
     emit({ status: 'searching', reason: `Retrying Apply click (${attempt + 1}/3)...` });
@@ -1736,6 +1899,7 @@ function findChatInputInRoot(root: ParentNode): HTMLElement | null {
 
   for (const el of candidates) {
     if (!softVisible(el)) continue;
+    if (isNonRecruiterNaukriWidget(el)) continue;
     if (isChatInputElement(el)) return el;
   }
 
@@ -1746,6 +1910,7 @@ function findChatInputInRoot(root: ParentNode): HTMLElement | null {
   for (const container of containers) {
     if (container instanceof HTMLElement && !softVisible(container)) continue;
     const text = (container.textContent ?? '').toLowerCase();
+    if (isNaukriPromoWidgetText(text)) continue;
     if (
       !text.includes('type message')
       && !text.includes('recruiter')
@@ -1766,13 +1931,22 @@ function findChatInputInRoot(root: ParentNode): HTMLElement | null {
     }
   }
 
-  // Visible empty text field sitting next to a Save button
+  // Visible empty text field sitting next to a Save button — only when the surrounding
+  // text actually reads like a recruiter question, otherwise Naukri's job-alert email box
+  // (which sits beside the listing's Save/bookmark button) gets answered by mistake.
   for (const el of candidates) {
     if (!softVisible(el)) continue;
     if ((el as HTMLInputElement).type === 'file') continue;
+    if (isNonRecruiterNaukriWidget(el)) continue;
     const parent = el.closest('div, form, section, aside, [role="dialog"]');
     if (!parent) continue;
+    const parentText = ((parent as HTMLElement).innerText ?? '').toLowerCase();
+    if (isNaukriPromoWidgetText(parentText)) continue;
+    if (!/recruiter|kindly answer|type message|experi|notice|ctc|salary|relocat|skip this question/.test(parentText)) {
+      continue;
+    }
     for (const btn of parent.querySelectorAll<HTMLElement>('button, [role="button"]')) {
+      if (isJobBookmarkSaveControl(btn)) continue;
       const saveText = normalizeText(btn.textContent ?? '');
       if (saveText === 'save' || saveText === 'send' || saveText === 'submit') return el;
     }
@@ -1800,15 +1974,103 @@ function findNaukriChatInput(root: ParentNode = document): HTMLElement | null {
 }
 
 function pageHasRecruiterChatbot(): boolean {
-  if (findNaukriChatInput(document)) return true;
-  if (getNaukriQuestionModal()) return true;
+  if (hasGenuineRecruiterChat()) return true;
   const text = document.body?.innerText?.toLowerCase() ?? '';
+  // Body text alone is too noisy (JD mentions "recruiter"); require chat chrome phrases
   return text.includes('type message here')
     || text.includes("recruiter's questions")
     || text.includes('recruiters questions')
     || text.includes('kindly answer all the recruiter')
-    || (text.includes('kindly answer') && (/experi|relocat|living in|ctc|notice/.test(text)))
-    || (text.includes('skip this question') && text.includes('save'));
+    || (text.includes('skip this question') && text.includes('type message'));
+}
+
+/**
+ * The recruiter chat/question modal while it is actually on screen.
+ * Any click outside this element closes the chat and Naukri then rejects the
+ * application as "incomplete", so every click path must check against it.
+ */
+function getOpenNaukriChatContainer(): HTMLElement | null {
+  const chat = findNaukriChatbotContainer();
+  if (chat && isVisible(chat)) return chat;
+  const modal = getNaukriQuestionModal();
+  if (modal instanceof HTMLElement && isVisible(modal)) return modal;
+  // No fallback to "any input's ancestor": on a plain job page that resolved to the
+  // listing card, and the run then answered the job title as if it were a question.
+  const input = findNaukriChatInput(document);
+  if (input && isInsideGenuineNaukriChatbot(input)) {
+    const scope = getChatbotScopeFromInput(input);
+    if (scope instanceof HTMLElement && isVisible(scope)) return scope;
+  }
+  return null;
+}
+
+function isNaukriChatOpen(): boolean {
+  return Boolean(getOpenNaukriChatContainer());
+}
+
+/**
+ * True only for a real recruiter Q&A modal. A bare text input on the job page (Naukri's
+ * job-alert box, search field) must not count, or the run answers the wrong form.
+ */
+function hasGenuineRecruiterChat(): boolean {
+  const chat = getOpenNaukriChatContainer();
+  if (!chat) return false;
+  const text = (chat.innerText || '').slice(0, 3000);
+  if (isNaukriPromoWidgetText(text)) return false;
+  // Must be a real chatbot panel OR show classic recruiter-chat chrome
+  const hasChatChrome = isInsideGenuineNaukriChatbot(chat)
+    || containerLooksLikeRecruiterChat(text)
+    || Boolean(chat.querySelector?.('.chatbot_NaukriWBot, [class*="NaukriWBot"], [class*="botContainer"]'));
+  if (!hasChatChrome) return false;
+  if (containerLooksLikeRecruiterChat(text)) return true;
+  const question = extractRecruiterQuestionFromPage(chat);
+  return Boolean(question && !isNaukriJobDescriptionText(question));
+}
+
+/** Close Naukri's profile / account drawer if it was opened by a stray click. */
+function dismissNaukriProfileDrawer(): void {
+  const drawers = document.querySelectorAll<HTMLElement>(
+    '[class*="drawer" i], [class*="nI-gNb" i], [role="dialog"], [class*="profile" i]',
+  );
+  for (const el of drawers) {
+    if (!isVisible(el)) continue;
+    const text = (el.innerText || '').slice(0, 800);
+    if (!/view (?:&|and) update profile|upgrade to naukri pro|search appearances|recruiter actions|naukri blog/i.test(text)) {
+      continue;
+    }
+    const closeBtn = el.querySelector<HTMLElement>(
+      'button[aria-label*="close" i], [class*="close" i], [data-testid*="close" i], button',
+    );
+    // Prefer an X / close control; otherwise press Escape
+    if (closeBtn && /close|×|✕/i.test(`${closeBtn.getAttribute('aria-label') || ''} ${closeBtn.textContent || ''}`)) {
+      forceClick(closeBtn);
+    } else {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true }));
+      document.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', bubbles: true }));
+    }
+    return;
+  }
+}
+
+function isInsideNaukriChat(el: Element | null | undefined): boolean {
+  if (!el) return false;
+  const chat = getOpenNaukriChatContainer();
+  return Boolean(chat && (chat === el || chat.contains(el)));
+}
+
+/** Job listings carry their own Save (bookmark) button next to Apply — never click it in chat flows. */
+function isJobBookmarkSaveControl(el: HTMLElement): boolean {
+  const meta = normalizeText(
+    [el.getAttribute('aria-label'), el.getAttribute('title'), el.className?.toString()]
+      .filter(Boolean)
+      .join(' '),
+  );
+  if (meta.includes('save job') || meta.includes('savejob') || meta.includes('bookmark')) return true;
+  const text = normalizeText(el.textContent ?? '');
+  if (text === 'saved') return true;
+  return Boolean(
+    el.closest('#apply-button, [class*="apply-button" i], [class*="jhc__btn" i], [class*="save-job" i]'),
+  );
 }
 
 /** Ask background to type+Save in MAIN world (all frames) — bypasses React controlled-input issues. */
@@ -1826,9 +2088,10 @@ async function answerNaukriChatDirect(
   jobTitle?: string,
   company?: string,
 ): Promise<boolean> {
-  // Never type when Yes/No or range options are on screen
+  // Never type when Yes/No or real choice options are on screen
   const container = findNaukriChatbotContainer() ?? document.body;
-  if (collectNaukriChoiceOptions(container).length > 0) {
+  const visibleOptions = collectNaukriChoiceOptions(container);
+  if (hasRealSelectableChoices(visibleOptions, '', findNaukriChatInput(document))) {
     emit({
       status: 'searching',
       jobTitle,
@@ -1840,6 +2103,7 @@ async function answerNaukriChatDirect(
 
   const input = findNaukriChatInput(document);
   if (!input) return false;
+  if (isNonRecruiterNaukriWidget(input)) return false;
 
   emit({ status: 'searching', jobTitle, company, reason: `Typing into chat: ${answer}` });
 
@@ -2039,12 +2303,16 @@ function findChatSendControl(chatInput: HTMLElement, scope: ParentNode): HTMLEle
   add(chatInput.closest('[class*="chat"]'));
   add(scope);
 
+  const chatOpen = isNaukriChatOpen();
+
   for (const root of roots) {
     const fromHelper = findChatbotSendButton(root, chatInput);
     if (fromHelper) return fromHelper;
 
     for (const el of root.querySelectorAll<HTMLElement>('button, [role="button"], a, span, div, i')) {
       if (!isVisible(el)) continue;
+      if (isPromoActionControl(el)) continue;
+      if (chatOpen && !isInsideNaukriChat(el)) continue;
       const cls = (el.className?.toString() ?? '').toLowerCase();
       const aria = (el.getAttribute('aria-label') ?? '').toLowerCase();
       const title = (el.getAttribute('title') ?? '').toLowerCase();
@@ -2056,7 +2324,7 @@ function findChatSendControl(chatInput: HTMLElement, scope: ParentNode): HTMLEle
         || (hasSendIcon && el.closest('[class*="footer"], [class*="input"], [class*="chat"]'))
       ) {
         const clickable = (el.closest('button, a, [role="button"]') as HTMLElement | null) ?? el;
-        if (isVisible(clickable)) return clickable;
+        if (isVisible(clickable) && !isPromoActionControl(clickable)) return clickable;
       }
     }
 
@@ -2128,18 +2396,78 @@ function isOurChatAnswerLine(text: string): boolean {
   return false;
 }
 
+/**
+ * Naukri's own widgets (job alerts, "Send me jobs like this", profile menu, search) also
+ * contain text inputs and labels that read like questions. Answering them creates job
+ * alerts and opens unrelated pages, so they must never be mistaken for the recruiter chat.
+ */
+function isNaukriPromoWidgetText(text: string): boolean {
+  return /job alert|jobs like this|get job alerts|similar jobs|subscribe|newsletter|search jobs here|upgrade to naukri pro|view (?:&|and) update profile|search appearances|recruiter actions|naukri blog|log ?out|sign ?in/i
+    .test(text);
+}
+
+/** Job-description / listing copy — never treat JD bullets as recruiter questions. */
+function isNaukriJobDescriptionText(text: string): boolean {
+  const t = text.replace(/\s+/g, ' ').trim();
+  if (!t) return false;
+  // Numbered / bulleted requirement lines: "1. .NET experience is a must..."
+  if (/^\d+[\.\)]\s/.test(t) || /^[-•*]\s/.test(t)) return true;
+  if (/job description|roles?\s*(and|&)?\s*responsibilit|key skills|must have|nice to have|preferred skills|about (the )?company|who can apply|education\s*:/i.test(t)) {
+    return true;
+  }
+  // Requirement statements that mention experience but are not questions
+  if (!t.includes('?') && /\bis a must\b|\bmust have\b|\brequired\b|\bmandatory\b|\bknowledge of\b/i.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+function isInsideGenuineNaukriChatbot(el: Element | null | undefined): boolean {
+  if (!el || !(el instanceof Element)) return false;
+  return Boolean(
+    el.closest?.(
+      '.chatbot_NaukriWBot, .botContainer, [class*="NaukriWBot" i], [class*="chatbot_" i], [class*="applyModal" i], [class*="apply-modal" i]',
+    ),
+  );
+}
+
+function containerLooksLikeRecruiterChat(text: string): boolean {
+  return /type message|kindly answer|recruiter'?s? questions|skip this question|thank you for your responses|hi [\w\s]+,? thank you for showing interest/i
+    .test(text);
+}
+
+function isNonRecruiterNaukriWidget(el: Element | null | undefined): boolean {
+  if (!el) return false;
+  // Anything genuinely inside the recruiter chat is always allowed
+  if (isInsideGenuineNaukriChatbot(el)) return false;
+  const own = [
+    (el as HTMLInputElement).placeholder,
+    el.getAttribute?.('aria-label'),
+    el.getAttribute?.('name'),
+    el.getAttribute?.('id'),
+  ].filter(Boolean).join(' ');
+  if (isNaukriPromoWidgetText(own)) return true;
+
+  const host = el.closest?.('form, section, aside, [role="dialog"], div');
+  const text = ((host as HTMLElement | null)?.innerText || '').replace(/\s+/g, ' ').slice(0, 400);
+  return isNaukriPromoWidgetText(text);
+}
+
 function looksLikeChatbotQuestion(text: string): boolean {
   const t = text.replace(/\s+/g, ' ').trim();
   const lower = t.toLowerCase();
   if (t.length < 8 || t.length > 500) return false;
   if (isOurChatAnswerLine(t)) return false;
+  if (isNaukriPromoWidgetText(t)) return false;
+  if (isNaukriJobDescriptionText(t)) return false;
   if (/type\s*messag|apply\s*now|^save$|search\s*jobs|thank you for showing interest|kindly answer all|recruiter'?s? questions|successfully apply for the job|hi [a-z]+ [a-z]+,? thank you/i.test(lower)) {
     return false;
   }
-  // Include common Naukri misspellings: experiance / experince
+  // Real recruiter Qs almost always ask something — prefer "?" or interrogative openers.
+  // Do NOT match bare JD phrases just because they contain the word "experience".
   return t.includes('?')
     || /^(how|what|where|which|are you|do you|have you|will you|can you|would you|please|enter|rate|tell)/i.test(t)
-    || /how many|years of|experi[ea]nce|experince|ctc|notice|salary|lac|lakh|lpa|last working day|proficiency|residing|relocate|percentage|cgpa|living in|ready to relocate|spring\s*boot|laravel|php/i.test(lower);
+    || /how many years|years of experi|experi[ea]nce\s*\?|ctc|notice period|current salary|expected salary|lac|lakh|lpa|last working day|residing|relocate|percentage|cgpa|living in|ready to relocate/i.test(lower);
 }
 
 /** Pull the current recruiter question from messenger / Yes-No modals even when DOM nesting is odd. */
@@ -2153,15 +2481,27 @@ function extractRecruiterQuestionFromPage(preferredScope?: ParentNode | null): s
   const input = findNaukriChatInput(document);
   if (input) push(getChatbotScopeFromInput(input));
   document.querySelectorAll<HTMLElement>(
-    '[role="dialog"], [class*="chatbot" i], [class*="Chatbot"], [class*="NaukriWBot"], [class*="botContainer"], [class*="modal" i], [class*="Modal"]',
+    '[class*="chatbot" i], [class*="Chatbot"], [class*="NaukriWBot"], [class*="botContainer"], [class*="applyModal" i], [class*="apply-modal" i]',
   ).forEach((el) => {
     if (isVisible(el)) push(el);
   });
-  push(document.body);
+  // Only include generic dialogs that already look like recruiter chat — never the whole job page
+  document.querySelectorAll<HTMLElement>('[role="dialog"], [class*="modal" i], [class*="Modal"]').forEach((el) => {
+    if (!isVisible(el)) return;
+    const text = (el.innerText || '').slice(0, 2000);
+    if (isNaukriPromoWidgetText(text) || isNaukriJobDescriptionText(text.slice(0, 200))) return;
+    if (containerLooksLikeRecruiterChat(text)) push(el);
+  });
+  // Never push document.body — JD bullets ("1. .NET experience...") look like questions there
 
   for (const scope of scopes) {
+    const scopeText = ((scope as HTMLElement).innerText ?? '').slice(0, 400);
+    if (isNaukriPromoWidgetText(scopeText)) continue;
+
     const fromHelper = getModalQuestionText(scope);
-    if (fromHelper && fromHelper.length >= 8) return fromHelper;
+    if (fromHelper && fromHelper.length >= 8 && !isNaukriJobDescriptionText(fromHelper)) {
+      return fromHelper;
+    }
 
     const raw = ((scope as HTMLElement).innerText ?? (scope as Document).body?.innerText ?? '')
       .replace(/\u00a0/g, ' ');
@@ -2175,6 +2515,7 @@ function extractRecruiterQuestionFromPage(preferredScope?: ParentNode | null): s
 
     for (let i = chunks.length - 1; i >= 0; i--) {
       const chunk = chunks[i];
+      if (isNaukriJobDescriptionText(chunk)) continue;
       // Prefer a trailing "?" segment inside a long blob
       const qMatch = chunk.match(/((?:How|What|Where|Which|Are you|Do you|Have you|Will you|Can you|Please)[^?]{6,220}\?)/i);
       if (qMatch && looksLikeChatbotQuestion(qMatch[1])) return qMatch[1].trim();
@@ -2184,41 +2525,41 @@ function extractRecruiterQuestionFromPage(preferredScope?: ParentNode | null): s
   return '';
 }
 
+/**
+ * Roots that may be scanned for recruiter questions. Everything here must belong to a real
+ * chat panel — scanning the job page turned JD lines and the job title into "questions".
+ */
 function collectChatbotSearchRoots(scope: ParentNode): ParentNode[] {
   const searchIn: ParentNode[] = [];
   const push = (el: ParentNode | null | undefined) => {
-    if (el && !searchIn.includes(el)) searchIn.push(el);
+    if (!el || searchIn.includes(el)) return;
+    if (el === document || el === document.body || el === document.documentElement) return;
+    if (el instanceof HTMLElement) {
+      if (!isVisible(el)) return;
+      const text = (el.innerText || '').slice(0, 2000);
+      if (isNaukriPromoWidgetText(text)) return;
+      if (!isInsideGenuineNaukriChatbot(el) && !containerLooksLikeRecruiterChat(text)) return;
+    }
+    searchIn.push(el);
   };
 
   if (scope instanceof Element) {
     push(scope.closest?.(
-      '[class*="chatbot"], [class*="Chatbot"], [class*="NaukriWBot"], [class*="botContainer"], [role="dialog"], [class*="modal"], [class*="Modal"]',
+      '.chatbot_NaukriWBot, .botContainer, [class*="NaukriWBot" i], [class*="chatbot_" i], [role="dialog"]',
     ));
     push(scope);
-    // Walk up a few parents — Naukri messenger often nests input outside message list
-    let p: HTMLElement | null = scope.parentElement;
-    for (let i = 0; i < 6 && p; i++, p = p.parentElement) {
-      const cls = p.className?.toString?.() ?? '';
-      if (/chat|bot|modal|dialog|drawer|panel|apply/i.test(cls) || p.getAttribute('role') === 'dialog') {
-        push(p);
-        break;
-      }
-    }
-  } else if (scope !== document && scope !== document.body && scope !== document.documentElement) {
+  } else {
     push(scope);
   }
 
   if (searchIn.length === 0) {
     document.querySelectorAll<HTMLElement>(
-      '[class*="chatbot"], [class*="Chatbot"], [class*="NaukriWBot"], [class*="botContainer"], [class*="botMsg"], [role="dialog"]',
-    ).forEach((el) => {
-      if (isVisible(el)) push(el);
-    });
+      '.chatbot_NaukriWBot, .botContainer, [class*="NaukriWBot" i], [class*="chatbot_" i], [class*="botMsg" i]',
+    ).forEach((el) => push(el));
   }
 
-  // Always try the live chat input's ancestor as a root
-  const input = findNaukriChatInput(document);
-  if (input) push(getChatbotScopeFromInput(input));
+  const chat = getOpenNaukriChatContainer();
+  if (chat) push(chat);
 
   return searchIn;
 }
@@ -2358,13 +2699,26 @@ function findNaukriChatbotContainer(): HTMLElement | null {
       if (!isVisible(el)) return;
       if (el.querySelector('#apply-button, button#apply-button')) return;
       const text = (el.innerText || '').slice(0, 2000).toLowerCase();
+      // Profile menu / job-alert popups are dialogs too — never treat them as the chat
+      if (isNaukriPromoWidgetText(text)) return;
+      // Job detail panels can match [role="dialog"] — reject JD-only nodes
+      if (/job description|roles?\s*(and|&)?\s*responsibilit|key skills|send me jobs like this/i.test(text)
+        && !containerLooksLikeRecruiterChat(text)) {
+        return;
+      }
       let score = 0;
-      if (/will you attend|walk-?\s*in|relocat|resid|how many years|type message|kindly answer|recruiter|whitefield|skip this question|mg road/i.test(text)) score += 50;
-      if (el.querySelector('input[type="radio"], [role="radio"], input[type="checkbox"]')) score += 40;
+      const isKnownChatClass = /naukriwbot|chatbot_|botcontainer|applymodal|apply-modal/i
+        .test(el.className?.toString() || '');
+      if (isKnownChatClass) score += 80;
+      if (containerLooksLikeRecruiterChat(text)) score += 50;
+      if (/will you attend|walk-?\s*in|relocat|resid|how many years|whitefield|mg road/i.test(text)) score += 30;
+      if (el.querySelector('input[type="radio"], [role="radio"], input[type="checkbox"]')) score += 20;
       if (el.querySelector('input, textarea, [contenteditable]')) score += 10;
-      if (/\bsave\b/i.test(el.innerText || '')) score += 15;
+      if (/\bsave\b/i.test(el.innerText || '') && containerLooksLikeRecruiterChat(text)) score += 15;
       const rect = el.getBoundingClientRect();
-      if (rect.height > 200 && rect.width > 200) score += 10;
+      if (rect.height > 200 && rect.width > 200 && isKnownChatClass) score += 10;
+      // Require strong evidence — size+input alone must not win
+      if (score < 50) return;
       if (score > bestScore) {
         bestScore = score;
         best = el;
@@ -2374,17 +2728,14 @@ function findNaukriChatbotContainer(): HTMLElement | null {
   if (best) return best;
 
   const chatInput = findNaukriChatInput(document);
-  if (chatInput) {
-    let el: HTMLElement | null = chatInput.parentElement;
-    for (let i = 0; i < 16 && el; i++, el = el.parentElement) {
-      const hasOptions = el.querySelectorAll(
-        'input[type="radio"], [role="radio"], input[type="checkbox"]',
-      ).length > 0;
-      const hasQ = (el.innerText || '').includes('?');
-      if (hasOptions && hasQ) return el;
-      if (el.getAttribute('role') === 'dialog') return el;
+  if (chatInput && !isNonRecruiterNaukriWidget(chatInput)) {
+    const scope = getChatbotScopeFromInput(chatInput);
+    if (scope instanceof HTMLElement) {
+      const text = (scope.innerText || '').slice(0, 2000);
+      if (containerLooksLikeRecruiterChat(text) || isInsideGenuineNaukriChatbot(chatInput)) {
+        return scope;
+      }
     }
-    return getChatbotScopeFromInput(chatInput) as HTMLElement;
   }
   return null;
 }
@@ -2430,14 +2781,26 @@ function collectNaukriChoiceOptions(scope: ParentNode): ChoiceOption[] {
   const optionLike = scope.querySelectorAll<HTMLElement>(
     'label, li, [class*="option" i], [class*="radio" i], [class*="choice" i], [class*="chip" i], [class*="answer" i], button, div[tabindex], span[tabindex]',
   );
+  const scopeIsChat = scope instanceof Element
+    ? (isInsideGenuineNaukriChatbot(scope) || containerLooksLikeRecruiterChat((scope as HTMLElement).innerText || ''))
+    : false;
   for (const el of optionLike) {
     if (el.closest('input, textarea, [contenteditable]')) continue;
+    // Never treat job-description list items as chat options
+    if (el.closest('[class*="job-desc" i], [class*="jobDesc" i], [class*="styles_jhc" i], #job_description, .dang-inner-html')) {
+      continue;
+    }
     const text = (el.textContent || '').replace(/\s+/g, ' ').trim();
     if (!text || text.length > 60) continue;
+    if (isNaukriJobDescriptionText(text)) continue;
+    const isBareNumber = /^(>=?\s*|≤\s*|<=\s*)?\d+(\.\d+)?\+?$/.test(text);
+    // Bare numbers (1, 2, 3…) are only valid inside a real chat — otherwise JD "1." / filters match
+    if (isBareNumber && !scopeIsChat && !isInsideGenuineNaukriChatbot(el)) continue;
     const looksLikeOption =
       /^(yes|no)\b/i.test(text)
       || /yes,? i will|no,? i will|will attend|will not/i.test(text)
       || /no experience|fresher|<\s*1\s*year|1\s*[-–]\s*2\s*year|2\s*[-–]\s*3\s*year|>\s*3\s*year|more than 3/i.test(text)
+      || isBareNumber
       || /skip this question|whitefield|mg road|koramangala|hsr|indiranagar/i.test(text);
     if (!looksLikeOption) continue;
     if (el.querySelectorAll('input[type="radio"], [role="radio"], input[type="checkbox"]').length > 1) continue;
@@ -2460,10 +2823,26 @@ function collectNaukriChoiceOptions(scope: ParentNode): ChoiceOption[] {
 }
 
 function scoreExperienceRangeLabel(label: string, years: number): number {
-  const l = label.toLowerCase();
+  const l = label.toLowerCase().replace(/\s+/g, ' ').trim();
   if (/no experience|fresher|^nil$|zero/.test(l)) return years <= 0 ? 100 : -1;
   if (/<\s*1|less than\s*1|below\s*1|0\s*[-–]\s*1/.test(l)) return years > 0 && years < 1 ? 100 : -1;
-  if (/>\s*3|more than\s*3|above\s*3|3\+|over\s*3/.test(l)) return years > 3 ? 100 : years >= 3 ? 70 : -1;
+  if (/>\s*3|more than\s*3|above\s*3|over\s*3/.test(l) && !/^>=?\s*\d/.test(l)) {
+    return years > 3 ? 100 : years >= 3 ? 70 : -1;
+  }
+  // ">=5", "≥5", "5+", ">5"
+  const gte = l.match(/^(?:>=|≥|>)\s*(\d+(?:\.\d+)?)$/) || l.match(/^(\d+(?:\.\d+)?)\+$/);
+  if (gte) {
+    const n = Number(gte[1]);
+    if (!Number.isFinite(n)) return -1;
+    return years >= n ? 95 : Math.max(0, 40 - Math.abs(years - n) * 10);
+  }
+  // "<=2", "<3"
+  const lte = l.match(/^(?:<=|≤|<)\s*(\d+(?:\.\d+)?)$/);
+  if (lte) {
+    const n = Number(lte[1]);
+    if (!Number.isFinite(n)) return -1;
+    return years <= n ? 95 : -1;
+  }
   const range = l.match(/(\d+(?:\.\d+)?)\s*[-–to]+\s*(\d+(?:\.\d+)?)/);
   if (range) {
     const a = Number(range[1]);
@@ -2475,6 +2854,17 @@ function scoreExperienceRangeLabel(label: string, years: number): number {
   if (single) {
     const n = Number(single[1]);
     return Math.abs(n - years) < 0.6 ? 80 : -1;
+  }
+  // Bare checkbox labels: "2", "3", "4", "5" (Hyperworks-style)
+  const bare = l.match(/^(\d+(?:\.\d+)?)$/);
+  if (bare) {
+    const n = Number(bare[1]);
+    if (!Number.isFinite(n)) return -1;
+    const diff = Math.abs(n - years);
+    if (diff < 0.6) return 92;
+    if (diff <= 1) return 70;
+    if (diff <= 2) return 40;
+    return -1;
   }
   return -1;
 }
@@ -2488,7 +2878,7 @@ function hasRealSelectableChoices(
   const meaningful = options.filter((o) => !/^skip(\s+this\s+question)?$/i.test(o.label.trim()));
   const hasYearRanges = meaningful.some(
     (o) => scoreExperienceRangeLabel(o.label, 5) >= 0
-      || /no experience|fresher|<\s*1\s*year|1\s*[-–]\s*2|2\s*[-–]\s*3|>\s*3/i.test(o.label),
+      || /no experience|fresher|<\s*1\s*year|1\s*[-–]\s*2|2\s*[-–]\s*3|>\s*3|^(>=?\s*)?\d+\+?$/i.test(o.label),
   );
   const hasYesNo = meaningful.some(
     (o) => /^(yes|no)\b/i.test(o.label.trim()) || /will attend|will not attend/i.test(o.label),
@@ -2497,19 +2887,26 @@ function hasRealSelectableChoices(
     (o) => /whitefield|mg road|koramangala|hsr|indiranagar|electronic city|skip this question/i.test(o.label),
   );
   const hasNativeChoice = meaningful.some(
-    (o) => o.input?.type === 'radio' || o.input?.type === 'checkbox',
+    (o) => o.input?.type === 'radio' || o.input?.type === 'checkbox'
+      || o.el.getAttribute('role') === 'radio'
+      || o.el.getAttribute('role') === 'checkbox',
+  );
+  const hasBareYearNumbers = meaningful.some(
+    (o) => /^(>=?\s*|≤\s*|<=\s*)?\d+(\.\d+)?\+?$/.test(o.label.trim()),
   );
 
-  // Chat "Type message here..." for years of experience → type the number, do NOT click Skip
+  // Free-text chat only when there are truly no selectable options (Skip alone does not count)
   if (
     chatInput
     && /how many years|years of experience|experience (do you have|in)\b/i.test(questionText)
     && !hasYearRanges
+    && !hasBareYearNumbers
+    && !hasNativeChoice
   ) {
     return false;
   }
 
-  return hasYearRanges || hasYesNo || hasLocationAreas || hasNativeChoice;
+  return hasYearRanges || hasYesNo || hasLocationAreas || hasNativeChoice || hasBareYearNumbers;
 }
 
 function pickChoiceOption(
@@ -2524,9 +2921,10 @@ function pickChoiceOption(
   // Never return Skip for experience questions when year-range radios exist or when typing is preferred
   const nonSkip = options.filter((o) => !/^skip(\s+this\s+question)?$/i.test(o.label.trim()));
 
-  // Experience range radios (No experience / 1-2 years / …)
-  if (/how many years|years of experience|experience (do you have|in)|exp in/i.test(q)
-    || options.some((o) => scoreExperienceRangeLabel(o.label, years) >= 0)) {
+  // Experience range radios / bare year checkboxes (2, 3, 4, 5, >=5)
+  if (/how many years|years of experience|experience (do you have|in)|exp in|fullstack|full\s*stack/i.test(q)
+    || options.some((o) => scoreExperienceRangeLabel(o.label, years) >= 0)
+    || options.some((o) => /^(>=?\s*|≤\s*|<=\s*)?\d+(\.\d+)?\+?$/.test(o.label.trim()))) {
     let best: ChoiceOption | null = null;
     let bestScore = -1;
     for (const o of nonSkip) {
@@ -2537,7 +2935,19 @@ function pickChoiceOption(
       }
     }
     if (best && bestScore >= 0) return best;
-    // No range match — do not fall through to Skip; caller should type free-text
+    // Closest bare-number fallback (never leave experience checkboxes unclicked)
+    let closest: ChoiceOption | null = null;
+    let closestDiff = Number.POSITIVE_INFINITY;
+    for (const o of nonSkip) {
+      const m = o.label.trim().match(/(\d+(?:\.\d+)?)/);
+      if (!m) continue;
+      const diff = Math.abs(Number(m[1]) - years);
+      if (diff < closestDiff) {
+        closestDiff = diff;
+        closest = o;
+      }
+    }
+    if (closest) return closest;
     return null;
   }
 
@@ -2573,28 +2983,39 @@ function pickChoiceOption(
 }
 
 function clickNaukriChoiceOption(option: ChoiceOption): void {
-  const targets: HTMLElement[] = [option.el];
-  if (option.input) targets.push(option.input);
+  // Prefer a single click target — clicking label + input toggles checkboxes OFF (click/unclick).
   const labelFor = option.input?.id
     ? document.querySelector<HTMLElement>(`label[for="${option.input.id}"]`)
     : null;
-  if (labelFor) targets.unshift(labelFor);
+  const target: HTMLElement = labelFor
+    ?? (option.input?.closest('label') as HTMLElement | null)
+    ?? option.el;
 
-  for (const t of targets) {
-    try {
-      t.scrollIntoView({ block: 'center', behavior: 'instant' });
-    } catch {
-      // ignore
+  try {
+    target.scrollIntoView({ block: 'center', behavior: 'instant' });
+  } catch {
+    // ignore
+  }
+
+  if (option.input) {
+    // Force checked ON without a prior toggle click
+    if (!option.input.checked) {
+      option.input.click();
     }
-    if (option.input && t === option.input) {
+    if (!option.input.checked) {
       option.input.checked = true;
       option.input.dispatchEvent(new Event('input', { bubbles: true }));
       option.input.dispatchEvent(new Event('change', { bubbles: true }));
+      forceClick(target);
     }
-    if (t.getAttribute('role') === 'radio') {
-      t.setAttribute('aria-checked', 'true');
+    if (option.input.getAttribute('role') === 'checkbox' || option.input.type === 'checkbox') {
+      option.input.setAttribute('aria-checked', 'true');
     }
-    forceClick(t);
+  } else {
+    if (target.getAttribute('role') === 'radio' || target.getAttribute('role') === 'checkbox') {
+      target.setAttribute('aria-checked', 'true');
+    }
+    forceClick(target);
   }
 }
 
@@ -2635,35 +3056,56 @@ async function selectNaukriQuestionOptions(
     reason: `Selecting option: "${pick.label}"`,
   });
   clickNaukriChoiceOption(pick);
-  await sleep(200);
+  await sleep(350);
 
-  // Trusted MAIN-world + CDP click — required for Naukri React forms
-  try {
-    const res = await sendRuntimeMessage<{
-      ok?: boolean;
-      clicked?: boolean;
-      label?: string;
-      checked?: boolean;
-    }>({
-      type: 'CLICK_NAUKRI_OPTION',
-      payload: { preferredLabel: pick.label, questionHint: questionText },
-    }, 8000);
-    if (res?.clicked) {
-      emit({
-        status: 'searching',
-        reason: `Option clicked (trusted): "${res.label || pick.label}"`,
-      });
-    }
-  } catch {
-    // local click already attempted
+  // Verify checkbox/radio stayed checked (Naukri double-click toggles off)
+  if (pick.input && !pick.input.checked) {
+    emit({ status: 'searching', reason: `Re-checking option "${pick.label}" (was toggled off)...` });
+    pick.input.checked = true;
+    pick.input.dispatchEvent(new Event('input', { bubbles: true }));
+    pick.input.dispatchEvent(new Event('change', { bubbles: true }));
+    const labelFor = pick.input.id
+      ? document.querySelector<HTMLElement>(`label[for="${pick.input.id}"]`)
+      : null;
+    forceClick(labelFor ?? pick.el);
+    await sleep(200);
   }
 
-  // Verify checkbox/radio state
+  // Trusted MAIN-world click ONLY if still unchecked — avoid second toggle
+  const needsTrusted = !pick.input || !pick.input.checked;
+  if (needsTrusted) {
+    try {
+      const res = await sendRuntimeMessage<{
+        ok?: boolean;
+        clicked?: boolean;
+        label?: string;
+        checked?: boolean;
+      }>({
+        type: 'CLICK_NAUKRI_OPTION',
+        payload: { preferredLabel: pick.label, questionHint: questionText, ensureChecked: true },
+      }, 8000);
+      if (res?.clicked) {
+        emit({
+          status: 'searching',
+          reason: `Option clicked (trusted): "${res.label || pick.label}"`,
+        });
+      }
+    } catch {
+      // local click already attempted
+    }
+  } else {
+    emit({
+      status: 'searching',
+      reason: `Option selected: "${pick.label}" (checked)`,
+    });
+  }
+
+  // Final verify
   if (pick.input) {
     pick.input.checked = true;
     pick.input.dispatchEvent(new Event('change', { bubbles: true }));
   }
-  return true;
+  return Boolean(!pick.input || pick.input.checked);
 }
 
 function questionHasChoiceControls(scope: ParentNode): boolean {
@@ -3126,13 +3568,24 @@ function getNaukriQuestionModal(): ParentNode | null {
   if (container) return container;
 
   const chatInput = findNaukriChatInput(document);
-  if (chatInput) return getChatbotScopeFromInput(chatInput);
+  if (chatInput && !isNonRecruiterNaukriWidget(chatInput)) {
+    const scope = getChatbotScopeFromInput(chatInput);
+    if (scope instanceof HTMLElement) {
+      const text = (scope.innerText || '').slice(0, 2000);
+      if (containerLooksLikeRecruiterChat(text) || isInsideGenuineNaukriChatbot(chatInput)) {
+        return scope;
+      }
+    }
+  }
 
   const dialogs = document.querySelectorAll('[role="dialog"]');
   for (const node of dialogs) {
     const el = node as HTMLElement;
     if (!isVisible(el)) continue;
     if (el.querySelector('#apply-button, button#apply-button')) continue;
+    const text = (el.innerText || '').slice(0, 2000);
+    if (isNaukriPromoWidgetText(text)) continue;
+    if (!containerLooksLikeRecruiterChat(text)) continue;
     if (!findModalActionButton(el)) continue;
     if (el.querySelectorAll('input[type="radio"], input:not([type="hidden"]):not([type="file"]), select, textarea, input[type="checkbox"]').length > 0) {
       return el;
@@ -3145,13 +3598,130 @@ function getNaukriChatbotRoot(): ParentNode | null {
   return getNaukriQuestionModal();
 }
 
+/**
+ * Naukri saveApply URLs encode result in multiApplyResp:
+ *   {"jobId":200} = success (green "Applied to ...")
+ *   {"jobId":406} = incomplete / not accepted (red Oops banner)
+ */
+function parseNaukriMultiApplyResp(): { jobId: string; code: number } | null {
+  try {
+    const href = window.location.href;
+    const raw = new URL(href).searchParams.get('multiApplyResp');
+    if (!raw) {
+      // Sometimes present in hash or already-decoded query
+      const m = href.match(/multiApplyResp=([^&]+)/i);
+      if (!m) return null;
+      const decoded = decodeURIComponent(m[1]);
+      const obj = JSON.parse(decoded) as Record<string, number>;
+      const [[jobId, code]] = Object.entries(obj);
+      return { jobId, code: Number(code) };
+    }
+    const obj = JSON.parse(raw) as Record<string, number>;
+    const entries = Object.entries(obj);
+    if (entries.length === 0) return null;
+    const [jobId, code] = entries[0];
+    return { jobId, code: Number(code) };
+  } catch {
+    return null;
+  }
+}
+
+/** 409xxx means Naukri already has an application for this job — not a failure. */
+function isNaukriAlreadyAppliedCode(code: number): boolean {
+  if (!Number.isFinite(code)) return false;
+  return code === 409 || Math.floor(code / 1000) === 409;
+}
+
+/** The response must belong to the job we are on — stale banners must not blame another job. */
+function naukriApplyRespMatchesCurrentJob(resp: { jobId: string; code: number }): boolean {
+  const stateUrl = loadNaukriState()?.currentDetailUrl;
+  const currentId = stateUrl ? naukriJobIdFromUrl(stateUrl) : null;
+  if (!currentId || !resp.jobId) return true;
+  return resp.jobId.includes(currentId) || currentId.includes(resp.jobId);
+}
+
+/** Incomplete / rejected apply (multiApplyResp 406, Oops banner, Naukri processing error). */
+function detectNaukriApplyRejected(): boolean {
+  const resp = parseNaukriMultiApplyResp();
+  if (resp && Number.isFinite(resp.code)) {
+    if (!naukriApplyRespMatchesCurrentJob(resp)) return false;
+    if (resp.code === 200 || isNaukriAlreadyAppliedCode(resp.code)) return false;
+    return true;
+  }
+
+  // Banner text only counts on Naukri's post-apply page — never a leftover banner on a listing
+  if (!isNaukriPostApplyUrl(window.location.href)) return false;
+
+  const text = (document.body?.innerText || '').slice(0, 3000).toLowerCase();
+  return text.includes('application was not accepted')
+    || text.includes('incomplete information')
+    || text.includes('answer all mandatory questions')
+    || text.includes('oops! your application was not accepted')
+    || text.includes('error while processing your job application');
+}
+
+/** True when Naukri says this job was already applied to (409xxx). */
+function detectNaukriAlreadyAppliedCode(): boolean {
+  const resp = parseNaukriMultiApplyResp();
+  if (!resp || !naukriApplyRespMatchesCurrentJob(resp)) return false;
+  return isNaukriAlreadyAppliedCode(resp.code);
+}
+
+/** Human-readable reason for a rejected apply, so the report says what actually happened. */
+function naukriApplyRejectionReason(): string {
+  const text = (document.body?.innerText || '').slice(0, 3000).toLowerCase();
+  if (text.includes('error while processing your job application')) {
+    return 'Naukri could not process the application — apply manually';
+  }
+  const resp = parseNaukriMultiApplyResp();
+  if (resp && Number.isFinite(resp.code) && resp.code !== 200) {
+    return `Application not accepted — unanswered questions (code ${resp.code})`;
+  }
+  return 'Application not accepted — unanswered questions';
+}
+
+/** True only for successful saveApply / Applied banner (multiApplyResp 200 or already-applied). */
+function detectNaukriApplyAcceptedPage(): boolean {
+  const resp = parseNaukriMultiApplyResp();
+  if (resp && naukriApplyRespMatchesCurrentJob(resp)) {
+    return resp.code === 200 || isNaukriAlreadyAppliedCode(resp.code);
+  }
+
+  // Fallback: green success banner copy (image 4) — not the Oops incomplete banner
+  if (detectNaukriApplyRejected()) return false;
+  const text = (document.body?.innerText || '').slice(0, 2500);
+  const lower = text.toLowerCase();
+  if (lower.includes('application was not accepted') || lower.includes('incomplete information')) {
+    return false;
+  }
+  // "Applied to \"Job Title\"" success banner
+  if (/applied to\s*["“']/i.test(text)) return true;
+  if (lower.includes('start your interview preparation') && lower.includes('applied to')) return true;
+  return false;
+}
+
 /** Naukri often navigates to a confirmation / my-apply page instead of flipping the job button to green. */
 function isNaukriApplyConfirmationPage(): boolean {
   if (!window.location.hostname.includes('naukri.com')) return false;
+
+  // Explicit reject codes / Oops banner — never confirmation
+  if (detectNaukriApplyRejected()) return false;
+
+  // multiApplyResp present — only 200 counts
+  const resp = parseNaukriMultiApplyResp();
+  if (resp) return resp.code === 200;
+
+  if (detectNaukriApplyAcceptedPage()) return true;
+
   const path = (window.location.pathname || '').toLowerCase();
   const href = window.location.href.toLowerCase();
 
-  // Common post-apply destinations (not company-site showAcp)
+  // /myapply/saveApply without a 200 code is NOT success (can be 406 incomplete)
+  if (path.includes('/myapply/saveapply') || href.includes('/myapply/saveapply')) {
+    return false;
+  }
+
+  // Other post-apply destinations
   if (
     path.includes('/myapply')
     || path.includes('/applied')
@@ -3161,78 +3731,112 @@ function isNaukriApplyConfirmationPage(): boolean {
     || href.includes('apply-success')
     || href.includes('applicationsuccess')
   ) {
-    return !href.includes('showacp');
+    return !href.includes('showacp') && detectNaukriApplyAcceptedPage();
   }
 
-  // Still on a job page? Then confirmation is content-based, not URL-based.
-  if (isNaukriJobDetailPage()) return false;
+  // Still on a job listing page — never treat as confirmation URL
+  if (isNaukriJobDetailPage() || isNaukriSearchPage()) return false;
 
-  const text = (document.body?.innerText || '').slice(0, 2500).toLowerCase();
-  const confirmationSignals = [
-    'application sent',
-    'application has been sent',
-    'you have successfully applied',
-    'successfully applied',
-    'applied successfully',
-    'thank you for applying',
-    'we have received your application',
-    'your application has been submitted',
-    'application submitted',
-    'similar jobs',
-    'jobs you may also like',
-    'recommended jobs for you',
+  return detectNaukriApplyAcceptedPage();
+}
+
+/**
+ * Chatbot completion — Naukri shows "Thank you for your responses" then redirects.
+ * Do NOT treat ordinary page copy ("100+ applied") as success.
+ */
+function detectNaukriChatThankYou(): boolean {
+  const roots: ParentNode[] = [];
+  const chat = findNaukriChatbotContainer();
+  if (chat) roots.push(chat);
+  const modal = getNaukriQuestionModal();
+  if (modal && modal !== chat) roots.push(modal);
+  document.querySelectorAll('[role="dialog"]').forEach((n) => roots.push(n));
+  if (roots.length === 0) roots.push(document.body);
+
+  const thankYou = [
+    'thank you for your response',
+    'thank you for your responses',
+    'thanks for your response',
+    'thanks for your responses',
+    'thank you for answering',
+    'thanks for answering',
+    'we have recorded your response',
+    'responses have been submitted',
+    'your responses have been',
   ];
-  // Require a success phrase, or "similar jobs" only when Apply was in flight
-  if (confirmationSignals.slice(0, 10).some((s) => text.includes(s))) return true;
-  const postApply = currentRunId
-    && sessionStorage.getItem(`job-autoapply-post-apply-${currentRunId}`) === '1';
-  if (postApply && (text.includes('similar jobs') || text.includes('jobs you may also like'))) {
-    return true;
+
+  for (const root of roots) {
+    const text = ((root as HTMLElement).innerText || (root as HTMLElement).textContent || '')
+      .replace(/\s+/g, ' ')
+      .toLowerCase()
+      .slice(0, 4000);
+    if (thankYou.some((s) => text.includes(s))) return true;
   }
   return false;
 }
 
+/** True while recruiter Q&A UI still needs answers — never count Applied in this state. */
+function naukriRecruiterQuestionsPending(): boolean {
+  if (detectNaukriChatThankYou()) return false;
+  if (pageHasRecruiterChatbot() || getNaukriQuestionModal() || findNaukriChatInput(document)) {
+    // Chat open with unanswered choice/input still counts as pending
+    const scope = findNaukriChatbotContainer() ?? getNaukriQuestionModal() ?? document.body;
+    const choices = collectNaukriChoiceOptions(scope as ParentNode);
+    const q = extractRecruiterQuestionFromPage(scope as ParentNode);
+    if (q && q.length >= 8 && !isNaukriDisclaimerOrNote(q)) return true;
+    if (choices.length > 0) return true;
+    if (findNaukriChatInput(document)) return true;
+    // Greeting / loading chat without a question yet — still pending
+    const text = ((scope as HTMLElement).innerText || '').toLowerCase();
+    if (text.includes('kindly answer') || text.includes("recruiter's questions") || text.includes('type message')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Strict success detection. Must NOT match listing copy like "100+ applicants have applied".
+ * While recruiter questions are open, always returns false.
+ * saveApply with multiApplyResp!=200 (e.g. 406 incomplete) is NEVER success.
+ */
 function detectNaukriApplySuccess(): boolean {
-  const snippets = [
-    'applied to',
-    'applied successfully',
-    'successfully applied',
-    'application submitted',
-    'your application has been sent',
-    'you have applied',
-    'application sent',
-    'thank you for applying',
-    'we have received your application',
-    'application has been received',
-    'you have successfully applied',
-    'application has been submitted',
-  ];
+  if (detectNaukriApplyRejected()) return false;
+  if (naukriRecruiterQuestionsPending()) return false;
 
-  // Prefer confirmation redirect / page (most common success path)
+  // URL / banner: only multiApplyResp 200 or green "Applied to ..."
+  if (detectNaukriApplyAcceptedPage()) return true;
+
+  // Strongest on job page: primary CTA flipped to Applied
+  if (naukriPrimaryApplyLooksApplied() || headerShowsAppliedBadge()) return true;
+
+  // Confirmation page helper (already excludes 406)
   if (isNaukriApplyConfirmationPage()) return true;
-  if (headerShowsAppliedBadge() || naukriPrimaryApplyLooksApplied()) return true;
 
-  // Toast / snackbar success (simple Apply often only shows a short toast)
+  // Chat thank-you alone is NOT enough — wait for redirect / Applied banner
+  // (thank-you is handled by waitForApplyOutcome)
+
+  // Toast / snackbar only (short visible alerts)
   for (const el of document.querySelectorAll<HTMLElement>(
-    '[class*="toast"], [class*="Toast"], [class*="snack"], [class*="Snack"], [class*="notify"], [role="alert"], [class*="success"]',
+    '[class*="toast"], [class*="Toast"], [class*="snack"], [class*="Snack"], [class*="notify"], [role="alert"], [class*="snackbar"]',
   )) {
     if (!isVisible(el)) continue;
     const t = normalizeText(el.textContent ?? '');
-    if (!t || t.length > 200) continue;
-    if (snippets.some((s) => t.includes(s)) || t.includes('applied')) return true;
+    if (!t || t.length > 180) continue;
+    if (t.includes('not accepted') || t.includes('incomplete')) continue;
+    if (
+      t.includes('successfully applied')
+      || t.includes('applied successfully')
+      || t.includes('application submitted')
+      || t.includes('application sent')
+      || t.includes('thank you for applying')
+      || /^applied to\b/.test(t)
+    ) {
+      return true;
+    }
   }
 
-  const nodes = document.querySelectorAll<HTMLElement>(
-    'h1, h2, h3, h4, p, span, div, [class*="success"], [class*="Success"], [class*="applied"], [class*="Applied"]',
-  );
-  for (const el of nodes) {
-    const t = (el.textContent ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
-    if (!t || t.length > 300) continue;
-    if (snippets.some((s) => t.includes(s))) return true;
-  }
-
-  const text = (document.body?.innerText || '').toLowerCase();
-  return snippets.some((s) => text.includes(s));
+  return false;
 }
 
 function headerShowsAppliedBadge(): boolean {
@@ -3306,6 +3910,8 @@ function pageShowsOtherApplyInProgress(): boolean {
 async function dismissNaukriApplyConflictToasts(): Promise<void> {
   for (const el of document.querySelectorAll<HTMLElement>('button, a, [role="button"]')) {
     if (!isVisible(el)) continue;
+    // Never press the chat's own close/X — that abandons the application
+    if (isInsideNaukriChat(el)) continue;
     const t = normalizeText(el.textContent ?? el.getAttribute('aria-label') ?? '');
     if (t === 'ok' || t === 'close' || t === 'dismiss' || t === 'got it') {
       forceClick(el);
@@ -3314,8 +3920,25 @@ async function dismissNaukriApplyConflictToasts(): Promise<void> {
   }
 }
 
+/**
+ * Naukri promo controls that must never be clicked as a chat action. "Send me jobs like this"
+ * contains the word "send", which used to win the Save/Send match and created a job alert.
+ */
+function isPromoActionControl(el: HTMLElement): boolean {
+  const text = normalizeText(el.textContent ?? el.getAttribute('value') ?? '');
+  const meta = normalizeText(
+    [el.getAttribute('aria-label'), el.getAttribute('title'), el.className?.toString()]
+      .filter(Boolean)
+      .join(' '),
+  );
+  const combined = `${text} ${meta}`;
+  return /send me jobs|jobs like this|job alert|create alert|subscribe|notify me|modify|register|sign ?in|log ?in/i
+    .test(combined);
+}
+
 function findModalActionButton(scope: ParentNode): HTMLElement | null {
   const labels = ['save', 'submit', 'send', 'next', 'done', 'continue'];
+  const chatOpen = isNaukriChatOpen();
   const nodes = scope.querySelectorAll<HTMLElement>(
     'button, a, [role="button"], input[type="submit"], input[type="button"], div[class*="btn"], span[class*="btn"]',
   );
@@ -3323,16 +3946,23 @@ function findModalActionButton(scope: ParentNode): HTMLElement | null {
   let bestScore = 0;
   for (const el of nodes) {
     if (!isVisible(el)) continue;
+    if (isJobBookmarkSaveControl(el)) continue;
+    if (isPromoActionControl(el)) continue;
+    // While the chat is open, only its own Save may be pressed
+    if (chatOpen && !isInsideNaukriChat(el)) continue;
     const text = normalizeText(el.textContent ?? el.getAttribute('value') ?? '');
     if (!text || isApplyLabel(text) || isExternalApplyText(text)) continue;
+    // Action buttons are short labels — a sentence containing "send" is not one
+    if (text.length > 18) continue;
     for (let i = 0; i < labels.length; i++) {
       const l = labels[i];
-      if (text === l || text.startsWith(`${l} `) || text.endsWith(` ${l}`) || text.includes(l)) {
-        const score = 100 - i * 10 + (text === l ? 20 : 0);
-        if (score > bestScore) {
-          bestScore = score;
-          best = el;
-        }
+      const exact = text === l;
+      const wordMatch = new RegExp(`\\b${l}\\b`).test(text);
+      if (!exact && !wordMatch) continue;
+      const score = 100 - i * 10 + (exact ? 20 : 0);
+      if (score > bestScore) {
+        bestScore = score;
+        best = el;
       }
     }
   }
@@ -3341,9 +3971,12 @@ function findModalActionButton(scope: ParentNode): HTMLElement | null {
   for (const sel of ['[class*="save"]', '[class*="Save"]', '[class*="submit"]', 'button.btn-primary']) {
     const el = scope.querySelector<HTMLElement>(sel);
     if (!el || !isVisible(el)) continue;
+    if (isJobBookmarkSaveControl(el)) continue;
+    if (isPromoActionControl(el)) continue;
+    if (chatOpen && !isInsideNaukriChat(el)) continue;
     const text = normalizeText(el.textContent ?? '');
-    if (!text || isApplyLabel(text) || text.includes('apply now')) continue;
-    if (labels.some((l) => text.includes(l))) return el;
+    if (!text || isApplyLabel(text) || text.includes('apply now') || text.length > 18) continue;
+    if (labels.some((l) => new RegExp(`\\b${l}\\b`).test(text))) return el;
   }
   return null;
 }
@@ -3365,21 +3998,35 @@ function findVisibleDialogForScope(scope: ParentNode): HTMLElement | null {
   return dialogs[0];
 }
 
+/**
+ * The Save that submits a chat answer. The listing's own Save (bookmark) sits next to
+ * Apply and is outside the chat — clicking it would close the chat, so it is never used.
+ */
 function findNaukriSaveButton(scope: ParentNode): HTMLElement | null {
-  const roots: ParentNode[] = [scope];
+  const chat = getOpenNaukriChatContainer();
+  const roots: ParentNode[] = [];
+  if (chat) roots.push(chat);
+  if (!roots.includes(scope)) roots.push(scope);
   const dialog = findVisibleDialogForScope(scope);
   if (dialog && !roots.includes(dialog)) roots.push(dialog);
 
   for (const root of roots) {
     const action = findModalActionButton(root);
-    if (action) return action;
+    if (!action) continue;
+    if (isJobBookmarkSaveControl(action)) continue;
+    if (chat && !isInsideNaukriChat(action)) continue;
+    return action;
   }
+
+  // Chat open: never search the whole page — that is how the listing Save got clicked
+  if (chat) return null;
 
   const candidates = Array.from(document.querySelectorAll<HTMLElement>(
     'button, [role="button"], input[type="submit"], input[type="button"], div, span',
   ));
   const visible = candidates.filter((el) => {
     if (!isVisible(el)) return false;
+    if (isJobBookmarkSaveControl(el)) return false;
     const text = normalizeText(el.textContent ?? el.getAttribute('value') ?? '');
     if (text !== 'save' && text !== 'submit' && text !== 'next' && text !== 'continue') return false;
     const rect = el.getBoundingClientRect();
@@ -3399,10 +4046,19 @@ async function clickNaukriSaveButton(
   const beforeQuestion = getModalQuestionText(scope);
 
   for (let attempt = 0; attempt < maxAttempts && !isStopped(); attempt++) {
-    const action = findNaukriSaveButton(scope) ?? findModalActionButton(scope);
+    let action = findNaukriSaveButton(scope) ?? findModalActionButton(scope);
+
+    // Chat open but Save not rendered yet — give it time instead of pressing Enter blindly
+    if (!action && isNaukriChatOpen()) {
+      for (let wait = 0; wait < 6 && !action && !isStopped(); wait++) {
+        await sleep(500);
+        action = findNaukriSaveButton(scope) ?? findModalActionButton(scope);
+      }
+    }
+
     if (action) {
       const label = action.textContent?.trim() || action.getAttribute('value') || 'Save';
-      emit({ status: 'searching', jobTitle, company, reason: `Clicking ${label}...` });
+      emit({ status: 'searching', jobTitle, company, reason: `Clicking ${label} in chat...` });
 
       if (action instanceof HTMLButtonElement && action.disabled) {
         action.disabled = false;
@@ -3411,13 +4067,15 @@ async function clickNaukriSaveButton(
       action.removeAttribute('aria-disabled');
       action.classList.remove('disabled');
 
+      action.scrollIntoView({ block: 'center', behavior: 'instant' as ScrollBehavior });
+      await sleep(250);
       clickElementCenter(action);
       forceClick(action);
-      await sleep(500);
+      await sleep(1200);
     } else {
       emit({ status: 'searching', jobTitle, company, reason: 'Pressing Enter to submit...' });
       pressEnterOnModal(scope);
-      await sleep(400);
+      await sleep(800);
     }
 
     if (detectNaukriApplySuccess() || isAlreadyAppliedOnPage()) return true;
@@ -3507,12 +4165,96 @@ async function waitForApplyOutcome(
   const start = Date.now();
   let chatAttempts = 0;
   let hadChat = false;
-  const startedOnDetail = isNaukriJobDetailPage();
+  let sawThankYou = false;
   let otherApplyWaits = 0;
 
   while (Date.now() - start < timeoutMs && !isStopped()) {
-    if (detectNaukriApplySuccess() || isNaukriApplyConfirmationPage()) return 'applied';
+    // Naukri already has an application for this job — success, not a rejection
+    if (detectNaukriAlreadyAppliedCode()) return 'applied';
+
+    // Incomplete apply (multiApplyResp 406 / Oops banner) — never count as Applied
+    if (detectNaukriApplyRejected()) {
+      emit({
+        status: 'searching',
+        jobTitle,
+        company,
+        reason: 'Application rejected — incomplete questions (not counted as Applied)',
+      });
+      return 'timeout';
+    }
+
+    // Never count success while questions are still on screen
+    if (naukriRecruiterQuestionsPending()) {
+      hadChat = true;
+      if (chatAttempts === 0) {
+        emit({
+          status: 'searching',
+          jobTitle,
+          company,
+          reason: 'Recruiter questions detected — answering chatbot...',
+        });
+      }
+      chatAttempts++;
+      const chatResult = await fillNaukriChatbot(profile, jobTitle, company);
+      if (chatResult === 'stuck') {
+        emit({
+          status: 'searching',
+          jobTitle,
+          company,
+          reason: 'Could not complete recruiter questions — will skip this job (not reopen)',
+        });
+        return 'timeout';
+      }
+      if (detectNaukriChatThankYou()) {
+        sawThankYou = true;
+        emit({
+          status: 'searching',
+          jobTitle,
+          company,
+          reason: 'Thank-you received — waiting for success page...',
+        });
+      } else if (chatResult === 'progress' && isNaukriChatOpen()) {
+        // More questions may still be loading — never leave the chat before the thank-you
+        emit({
+          status: 'searching',
+          jobTitle,
+          company,
+          reason: 'Chat still open — waiting for the next recruiter question...',
+        });
+        await sleep(2000);
+      }
+      await sleep(1200);
+      continue;
+    }
+
+    if (detectNaukriChatThankYou()) {
+      sawThankYou = true;
+      emit({
+        status: 'searching',
+        jobTitle,
+        company,
+        reason: 'Thank-you for responses — waiting for redirect / Applied...',
+      });
+      // Naukri usually redirects after thank-you — give it time
+      if (await waitForNaukriApplySuccess(12000)) return 'applied';
+      if (headerShowsAppliedBadge() || naukriPrimaryApplyLooksApplied()) return 'applied';
+      if (isNaukriApplyConfirmationPage()) return 'applied';
+      // Thank-you alone on detail without redirect — wait a bit more, then accept if Apply flipped
+      await sleep(2000);
+      if (headerShowsAppliedBadge() || naukriPrimaryApplyLooksApplied() || isNaukriApplyConfirmationPage()) {
+        return 'applied';
+      }
+      // Still on detail with thank-you and no questions → treat as applied
+      if (!naukriRecruiterQuestionsPending() && !isApplyButtonStillOnPage()) return 'applied';
+      if (!naukriRecruiterQuestionsPending() && (naukriPrimaryApplyLooksApplied() || headerShowsAppliedBadge())) {
+        return 'applied';
+      }
+    }
+
+    // Strict success only (no body-text false positives)
+    if (detectNaukriApplySuccess()) return 'applied';
     if (headerShowsAppliedBadge() || naukriPrimaryApplyLooksApplied()) return 'applied';
+    if (isNaukriApplyConfirmationPage()) return 'applied';
 
     // Transient Naukri conflict — wait; do NOT treat as "already applied to this job"
     if (pageShowsOtherApplyInProgress()) {
@@ -3526,9 +4268,9 @@ async function waitForApplyOutcome(
         });
         await dismissNaukriApplyConflictToasts();
         await sleep(2000);
-        // Prefer finishing open recruiter questions over abandoning this job
         if (pageHasRecruiterChatbot() || getNaukriQuestionModal()) {
-          await fillNaukriChatbot(profile, jobTitle, company);
+          const mid = await fillNaukriChatbot(profile, jobTitle, company);
+          if (mid === 'stuck') return 'timeout';
         }
         continue;
       }
@@ -3536,67 +4278,61 @@ async function waitForApplyOutcome(
 
     if (isAlreadyAppliedOnPage()) return 'already';
 
-    // Redirect away from job detail after Apply is the usual confirmation path
-    if (startedOnDetail && !isNaukriJobDetailPage() && !isNaukriSearchPage()) {
+    // Left job detail for a real confirmation URL (not search, not guessing)
+    if (!isNaukriJobDetailPage() && !isNaukriSearchPage()) {
       if (isNaukriApplyConfirmationPage() || detectNaukriApplySuccess()) return 'applied';
-      // Left the job page after questions / apply — likely confirmation interstitial
-      if (!pageHasRecruiterChatbot() && !findNaukriChatInput(document)) {
-        emit({
-          status: 'searching',
-          jobTitle,
-          company,
-          reason: 'Left job page after apply — counting as applied',
-        });
+      if (sawThankYou || hadChat) {
+        // After chat, a non-search redirect is usually success — verify strong signals
+        await sleep(1000);
+        if (isNaukriApplyConfirmationPage() || detectNaukriApplySuccess() || headerShowsAppliedBadge()) {
+          return 'applied';
+        }
+        const text = (document.body?.innerText || '').slice(0, 2000).toLowerCase();
+        if (
+          text.includes('successfully applied')
+          || text.includes('application submitted')
+          || text.includes('thank you for applying')
+          || text.includes('application sent')
+        ) {
+          return 'applied';
+        }
+      }
+    }
+
+    // Chat closed — wait for thank-you / Applied / redirect (do NOT assume success)
+    if (hadChat && !naukriRecruiterQuestionsPending()) {
+      emit({
+        status: 'searching',
+        jobTitle,
+        company,
+        reason: 'Chat closed — waiting for thank-you or Applied confirmation...',
+      });
+      const confirmed = await waitForNaukriApplySuccess(10000);
+      if (confirmed || headerShowsAppliedBadge() || naukriPrimaryApplyLooksApplied() || isNaukriApplyConfirmationPage()) {
         return 'applied';
       }
-    }
-
-    // Do NOT treat "back on search list" as applied — Apply often never registered.
-
-    const chatOpen = pageHasRecruiterChatbot() || Boolean(getNaukriQuestionModal()) || Boolean(findNaukriChatInput(document));
-    if (chatOpen) {
-      hadChat = true;
-      if (chatAttempts === 0) {
-        emit({
-          status: 'searching',
-          jobTitle,
-          company,
-          reason: 'Recruiter questions detected — answering chatbot...',
-        });
+      if (detectNaukriChatThankYou()) {
+        sawThankYou = true;
+        continue;
       }
-      chatAttempts++;
-      await fillNaukriChatbot(profile, jobTitle, company);
-      await sleep(400);
-      continue;
-    }
-
-    // Chat closed after we answered — Naukri often redirects to confirmation (no green Applied button)
-    if (hadChat) {
+      // Chat vanished without confirmation — keep waiting until timeout (may reopen questions)
       await sleep(800);
-      if (detectNaukriApplySuccess() || isNaukriApplyConfirmationPage() || headerShowsAppliedBadge()) {
-        return 'applied';
+      if (naukriRecruiterQuestionsPending()) continue;
+      // If Apply is still available, application did not complete
+      if (isApplyButtonStillOnPage() && !naukriPrimaryApplyLooksApplied()) {
+        return 'timeout';
       }
-      if (isAlreadyAppliedOnPage() && !pageShowsOtherApplyInProgress()) {
-        return 'already';
-      }
-      if (!isNaukriJobDetailPage() && !isNaukriSearchPage()) {
-        emit({ status: 'searching', jobTitle, company, reason: 'Chat finished — confirmation redirect, counting as applied' });
-        return 'applied';
-      }
-      if (naukriPrimaryApplyLooksApplied() || headerShowsAppliedBadge()) {
-        emit({ status: 'searching', jobTitle, company, reason: 'Chat finished — Applied confirmed' });
-        return 'applied';
-      }
-      if (await waitForNaukriApplySuccess(2500) || headerShowsAppliedBadge() || naukriPrimaryApplyLooksApplied()) return 'applied';
     }
 
     await sleep(500);
   }
 
-  if (detectNaukriApplySuccess() || isNaukriApplyConfirmationPage() || headerShowsAppliedBadge() || naukriPrimaryApplyLooksApplied()) return 'applied';
+  if (naukriRecruiterQuestionsPending()) return 'timeout';
+  if (detectNaukriApplySuccess() || isNaukriApplyConfirmationPage() || headerShowsAppliedBadge() || naukriPrimaryApplyLooksApplied()) {
+    return 'applied';
+  }
+  if (sawThankYou && !isApplyButtonStillOnPage()) return 'applied';
   if (isAlreadyAppliedOnPage() && !pageShowsOtherApplyInProgress()) return 'already';
-  if (hadChat && (naukriPrimaryApplyLooksApplied() || headerShowsAppliedBadge() || isNaukriApplyConfirmationPage())) return 'applied';
-  if (hadChat && !isNaukriJobDetailPage() && !isNaukriSearchPage()) return 'applied';
   return 'timeout';
 }
 
@@ -3610,6 +4346,7 @@ async function finalizeNaukriApplication(state: NaukriRunState): Promise<void> {
   clearNaukriConsecutiveRateLimits(state);
   markJobProcessed(state, url);
   state.counts.applied++;
+  recordAppliedLead(state.jobTitle, state.company, url);
   emit({ status: 'applied', jobTitle: state.jobTitle, company: state.company });
   saveNaukriState(state);
 
@@ -3632,28 +4369,49 @@ function getJobMeta(card: HTMLElement): { title: string; company: string } {
   return { title, company };
 }
 
-async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: string): Promise<void> {
+async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: string): Promise<'applied' | 'progress' | 'stuck'> {
   let lastQuestion = '';
   let sameQuestionCount = 0;
   let unreadQuestionCount = 0;
+  let madeProgress = false;
 
-  for (let step = 0; step < 12 && !isStopped(); step++) {
+  // The chat is only done when Naukri replies "Thank you for your responses" — keep answering until then
+  for (let step = 0; step < 30 && !isStopped(); step++) {
     try {
-      if (detectNaukriApplySuccess()) break;
+      // Strict success only — never while questions remain
+      if (detectNaukriChatThankYou() && !naukriRecruiterQuestionsPending()) {
+        emit({
+          status: 'searching',
+          jobTitle,
+          company,
+          reason: 'Chat thank-you seen — waiting for Applied confirmation...',
+        });
+        if (await waitForNaukriApplySuccess(10000) || headerShowsAppliedBadge() || naukriPrimaryApplyLooksApplied()) {
+          return 'applied';
+        }
+        // Thank-you without more questions — progress; caller waits for redirect
+        return 'progress';
+      }
+      if (detectNaukriApplySuccess() && !naukriRecruiterQuestionsPending()) return 'applied';
 
       let chatInput = findNaukriChatInput(document);
       if (!chatInput) {
-        await sleep(400);
+        await sleep(500);
         chatInput = findNaukriChatInput(document);
       }
 
-      // Always use the full chatbot panel — footer-only scope misses Yes/No radios above the input
-      const chatContainer = findNaukriChatbotContainer();
-      const scope = chatContainer
-        ?? (chatInput ? getChatbotScopeFromInput(chatInput) : null)
-        ?? getNaukriQuestionModal()
-        ?? document.body;
-      const optionScope = chatContainer ?? scope;
+      // Everything below must run inside the real chat panel. Without this guard the run
+      // scanned the job page and answered the job title / JD lines as recruiter questions.
+      const chatContainer = getOpenNaukriChatContainer();
+      if (!chatContainer) {
+        await sleep(600);
+        if (!getOpenNaukriChatContainer() && !detectNaukriChatThankYou()) {
+          return madeProgress ? 'progress' : 'stuck';
+        }
+        continue;
+      }
+      const scope: ParentNode = chatContainer;
+      const optionScope: ParentNode = chatContainer;
 
       let questionText = extractRecruiterQuestionFromPage(optionScope);
 
@@ -3702,16 +4460,16 @@ async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: 
           company,
           reason: 'Could not read recruiter question — waiting...',
         });
-        if (unreadQuestionCount >= 6) {
+        if (unreadQuestionCount >= 12) {
           emit({
             status: 'searching',
             jobTitle,
             company,
             reason: 'Could not read chatbot questions — moving on',
           });
-          break;
+          return madeProgress ? 'progress' : 'stuck';
         }
-        await sleep(700);
+        await sleep(1200);
         continue;
       }
       unreadQuestionCount = 0;
@@ -3720,15 +4478,15 @@ async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: 
       else sameQuestionCount = 0;
       lastQuestion = questionText;
 
-      // Stuck on same question after 2 tries — leave (avoid minutes of Save/Enter spam)
-      if (sameQuestionCount >= 2) {
+      // Stuck on the same question repeatedly — leave (avoid minutes of Save/Enter spam)
+      if (sameQuestionCount >= 4) {
         emit({
           status: 'searching',
           jobTitle,
           company,
           reason: 'Same recruiter question unanswered twice — moving on',
         });
-        break;
+        return 'stuck';
       }
 
       const answer = mapChatbotAnswer(questionText, profile)
@@ -3744,7 +4502,8 @@ async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: 
         });
         await clickNaukriSaveButton(optionScope, jobTitle, company, 2);
         await sleep(600);
-        if (detectNaukriApplySuccess() || isNaukriApplyConfirmationPage()) break;
+        if (detectNaukriApplySuccess() || isNaukriApplyConfirmationPage()) return 'applied';
+        madeProgress = true;
         continue;
       }
 
@@ -3755,7 +4514,7 @@ async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: 
           company,
           reason: `Unknown question — skipped (not guessing): "${questionText.replace(/\s+/g, ' ').trim().slice(0, 90)}"`,
         });
-        break;
+        return 'stuck';
       }
 
       const shortQ = questionText.replace(/\s+/g, ' ').trim().slice(0, 90);
@@ -3775,13 +4534,16 @@ async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: 
           reason: `Answering experience: "${shortQ}" → ${years}`,
         });
         const submitted = await answerNaukriChatDirect(years, jobTitle, company);
-        await sleep(400);
-        if (detectNaukriApplySuccess() || isNaukriApplyConfirmationPage()) break;
+        await sleep(600);
+        if (detectNaukriApplySuccess() || isNaukriApplyConfirmationPage()) return 'applied';
         const after = extractRecruiterQuestionFromPage(optionScope);
-        if (submitted || !after || after !== questionText) continue;
+        if (submitted || !after || after !== questionText) {
+          madeProgress = true;
+          continue;
+        }
         // One MAIN-world retry only
         await answerNaukriChatViaMainWorld(years, questionText);
-        await sleep(400);
+        await sleep(600);
         continue;
       }
 
@@ -3794,13 +4556,88 @@ async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: 
           reason: `Selecting option for: "${shortQ}" (${choiceOptions.length} choices)`,
         });
         const selected = await selectNaukriQuestionOptions(optionScope, questionText, profile, jobTitle);
-        await sleep(450);
+        await sleep(900);
         if (selected) {
-          await clickNaukriSaveButton(optionScope, jobTitle, company, 2);
-          await sleep(700);
-          if (detectNaukriApplySuccess() || isNaukriApplyConfirmationPage()) break;
-          const afterOpt = extractRecruiterQuestionFromPage(optionScope);
-          if (!afterOpt || afterOpt !== questionText) continue;
+          // Refuse to Save if the checkbox was toggled off (click/unclick bug)
+          let anyChecked = collectNaukriChoiceOptions(optionScope).some(
+            (o) => o.input?.checked || o.el.getAttribute('aria-checked') === 'true',
+          );
+          for (let retry = 0; retry < 2 && !anyChecked && !isStopped(); retry++) {
+            emit({
+              status: 'searching',
+              jobTitle,
+              company,
+              reason: 'Option did not stay checked — retrying before Save...',
+            });
+            await selectNaukriQuestionOptions(optionScope, questionText, profile, jobTitle);
+            await sleep(900);
+            anyChecked = collectNaukriChoiceOptions(optionScope).some(
+              (o) => o.input?.checked || o.el.getAttribute('aria-checked') === 'true',
+            );
+          }
+          if (!anyChecked && choiceOptions.some((o) => o.input || o.el.getAttribute('role') === 'checkbox')) {
+            emit({
+              status: 'searching',
+              jobTitle,
+              company,
+              reason: 'Checkbox still unchecked — not clicking Save yet',
+            });
+            await sleep(800);
+            continue;
+          }
+
+          // Always the Save inside the chat — the listing Save (bookmark) is never touched
+          await clickNaukriSaveButton(optionScope, jobTitle, company, 3);
+          emit({
+            status: 'searching',
+            jobTitle,
+            company,
+            reason: 'Saved answer in chat — waiting for the next question or thank-you...',
+          });
+
+          const afterSaveStart = Date.now();
+          let nextQuestionAppeared = false;
+          while (Date.now() - afterSaveStart < 25000 && !isStopped()) {
+            if (detectNaukriChatThankYou()) {
+              madeProgress = true;
+              break;
+            }
+            if (detectNaukriApplySuccess() && !naukriRecruiterQuestionsPending()) return 'applied';
+            const afterOpt = extractRecruiterQuestionFromPage(optionScope);
+            if (afterOpt && afterOpt !== questionText && afterOpt.length >= 8) {
+              emit({
+                status: 'searching',
+                jobTitle,
+                company,
+                reason: `Next question appeared: "${afterOpt.slice(0, 60)}..."`,
+              });
+              madeProgress = true;
+              sameQuestionCount = 0;
+              nextQuestionAppeared = true;
+              break;
+            }
+            // Chat vanished without a thank-you: give Naukri time to redirect/confirm
+            if (Date.now() - afterSaveStart > 10000 && !isNaukriChatOpen() && !pageHasRecruiterChatbot()) {
+              madeProgress = true;
+              break;
+            }
+            await sleep(700);
+          }
+          if (detectNaukriChatThankYou() || nextQuestionAppeared) {
+            await sleep(700);
+            continue;
+          }
+          if (!isNaukriChatOpen() && !pageHasRecruiterChatbot()) {
+            emit({
+              status: 'searching',
+              jobTitle,
+              company,
+              reason: 'Chat closed without a thank-you — verifying the application result...',
+            });
+            madeProgress = true;
+            await sleep(1500);
+            continue;
+          }
         } else {
           emit({
             status: 'searching',
@@ -3808,7 +4645,7 @@ async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: 
             company,
             reason: 'Could not match a visible option — moving on',
           });
-          break;
+          return 'stuck';
         }
         continue;
       }
@@ -3862,12 +4699,13 @@ async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: 
         if (await selectNaukriQuestionOptions(optionScope, questionText, profile, jobTitle)) didFill = true;
         await sleep(350);
         if (didFill) {
+          madeProgress = true;
           await clickNaukriSaveButton(optionScope, jobTitle, company, 2);
           await sleep(500);
-          if (detectNaukriApplySuccess() || isNaukriApplyConfirmationPage()) break;
+          if (detectNaukriApplySuccess() || isNaukriApplyConfirmationPage()) return 'applied';
           const afterForm = extractRecruiterQuestionFromPage(optionScope);
           if (!afterForm || afterForm !== questionText) continue;
-          if (sameQuestionCount >= 1) break;
+          if (sameQuestionCount >= 1) return 'stuck';
           continue;
         }
       }
@@ -3876,16 +4714,20 @@ async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: 
       if (chatInput && answer) {
         const submitted = await answerNaukriChatDirect(answer, jobTitle, company);
         await sleep(500);
-        if (detectNaukriApplySuccess()) break;
+        if (detectNaukriApplySuccess()) return 'applied';
         const afterDirect = getModalQuestionText(getNaukriQuestionModal() ?? scope);
-        if (submitted || (afterDirect && afterDirect !== questionText)) continue;
+        if (submitted || (afterDirect && afterDirect !== questionText)) {
+          madeProgress = true;
+          continue;
+        }
       }
 
       if (answer) {
         const ok = await answerNaukriChatViaMainWorld(answer, questionText);
         await sleep(600);
-        if (detectNaukriApplySuccess()) break;
+        if (detectNaukriApplySuccess()) return 'applied';
         if (ok) {
+          madeProgress = true;
           const again = findNaukriChatInput(document);
           if (again && getInputValue(again)) {
             await clickNaukriSaveButton(getChatbotScopeFromInput(again), jobTitle, company, 2);
@@ -3968,9 +4810,10 @@ async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: 
       // Form-modal choice controls (location checkboxes etc.)
       if (await selectNaukriQuestionOptions(optionScope, questionText, profile, jobTitle)) {
         didFill = true;
-        await sleep(300);
+        madeProgress = true;
+        await sleep(500);
         await clickNaukriSaveButton(optionScope, jobTitle, company, 2);
-        if (detectNaukriApplySuccess()) break;
+        if (detectNaukriApplySuccess()) return 'applied';
         const afterForm = extractRecruiterQuestionFromPage(optionScope);
         if (!afterForm || afterForm !== beforeQuestion) continue;
       }
@@ -3985,8 +4828,9 @@ async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: 
         if (getInputValue(chatField)) {
           await clickNaukriSaveButton(scope, jobTitle, company, 2);
           await submitChatAnswer(scope, chatField, jobTitle, company);
-          if (detectNaukriApplySuccess()) break;
-          await sleep(400);
+          if (detectNaukriApplySuccess()) return 'applied';
+          madeProgress = true;
+          await sleep(500);
           const nextQ = getModalQuestionText(getNaukriQuestionModal() ?? scope);
           if (nextQ && beforeQuestion && nextQ !== beforeQuestion) continue;
           continue;
@@ -3995,20 +4839,25 @@ async function fillNaukriChatbot(profile: Profile, jobTitle?: string, company?: 
 
       if (didFill || formModal) {
         const submitted = await clickNaukriSaveButton(scope, jobTitle, company, 2);
-        if (detectNaukriApplySuccess()) break;
-        if (submitted) continue;
+        if (detectNaukriApplySuccess()) return 'applied';
+        if (submitted) {
+          madeProgress = true;
+          continue;
+        }
       }
 
       if (pageHasRecruiterChatbot() || findNaukriChatInput(document)) {
         await sleep(500);
         continue;
       }
-      if (!didFill) break;
+      if (!didFill) return madeProgress ? 'progress' : 'stuck';
     } catch (err) {
       emit({ status: 'searching', jobTitle, company, reason: `Form fill warning: ${(err as Error).message}` });
-      break;
+      return madeProgress ? 'progress' : 'stuck';
     }
   }
+  if (detectNaukriApplySuccess() || isNaukriApplyConfirmationPage()) return 'applied';
+  return madeProgress ? 'progress' : 'stuck';
 }
 
 function returnToNaukriSearch(state: NaukriRunState, nextIndex: number): void {
@@ -4044,6 +4893,10 @@ async function applyOnNaukriDetailPage(profile: Profile, state: NaukriRunState):
     return;
   }
 
+  // Stray clicks sometimes open the account drawer — close it before any Apply/chat work
+  dismissNaukriProfileDrawer();
+  await sleep(200);
+
   // Never reopen a job we already skipped/failed/applied
   if (
     isNaukriJobHandled(state, listingUrl, jobTitle, company)
@@ -4058,7 +4911,7 @@ async function applyOnNaukriDetailPage(profile: Profile, state: NaukriRunState):
 
   // Recruiter Yes/No / chatbot already open (e.g. Uplers relocate modal) — answer it first.
   // Never treat this as "Repeated open after error".
-  if (pageHasRecruiterChatbot() || getNaukriQuestionModal() || findNaukriChatInput(document)) {
+  if (hasGenuineRecruiterChat()) {
     emit({
       status: 'searching',
       jobTitle,
@@ -4075,25 +4928,35 @@ async function applyOnNaukriDetailPage(profile: Profile, state: NaukriRunState):
       await finalizeNaukriApplication(state);
       return;
     }
-    // Still on questions after timeout — do not burn open-count; keep trying Apply path below
-    // only if Apply is still available; otherwise one more chat pass then advance carefully.
+    // Still stuck on unanswered questions — skip once, do NOT reopen 7–8 times
     if (pageHasRecruiterChatbot() || getNaukriQuestionModal()) {
-      await fillNaukriChatbot(profile, jobTitle, company);
+      const stuck = await fillNaukriChatbot(profile, jobTitle, company);
       await sleep(800);
-      if (detectNaukriApplySuccess() || headerShowsAppliedBadge() || naukriPrimaryApplyLooksApplied()) {
+      if (stuck === 'applied' || detectNaukriApplySuccess() || headerShowsAppliedBadge() || naukriPrimaryApplyLooksApplied()) {
         await finalizeNaukriApplication(state);
+        return;
+      }
+      if (stuck === 'stuck' || pageHasRecruiterChatbot() || getNaukriQuestionModal()) {
+        skipNaukriJobAndAdvance(
+          state,
+          'Could not answer recruiter questions — skipped (will not reopen)',
+          listingUrl,
+        );
         return;
       }
     }
   }
 
-  // Same posting opened many times — only skip if the page is truly dead
-  // (no Apply, no company-site CTA, no recruiter questions).
+  // Let the SPA finish painting Apply / company-site CTAs before declaring the page dead.
+  // Root cause of false "Repeated open": open-count was checked before Apply rendered.
+  await sleep(1200);
+  let ready = await waitForExternalOrNormalApply(6000);
+  let applyStillThere = Boolean(ready.apply ?? findNaukriApplyButtonSync());
+  let companySiteBtn = ready.external ?? findExternalApplyControl();
+  let chatStillOpen = pageHasRecruiterChatbot() || Boolean(getNaukriQuestionModal()) || Boolean(findNaukriChatInput(document));
+
   const openKey = `job-autoapply-open-count-${normalizeJobUrl(state.currentDetailUrl || listingUrl)}`;
   const openCount = Number(sessionStorage.getItem(openKey) || '0');
-  const applyStillThere = Boolean(findNaukriApplyButtonSync());
-  const companySiteBtn = findExternalApplyControl();
-  const chatStillOpen = pageHasRecruiterChatbot() || Boolean(getNaukriQuestionModal()) || Boolean(findNaukriChatInput(document));
 
   // Company-website Apply was missed before and burned open-count — capture it now
   if (companySiteBtn && !applyStillThere) {
@@ -4101,24 +4964,31 @@ async function applyOnNaukriDetailPage(profile: Profile, state: NaukriRunState):
     return;
   }
 
-  if (openCount >= 6 && !applyStillThere && !companySiteBtn && !chatStillOpen && !isApplyButtonStillOnPage()) {
+  // Only skip on high open-count when the posting is truly dead AFTER waiting for UI
+  if (openCount >= NAUKRI_MAX_JOB_OPENS - 1 && !applyStillThere && !companySiteBtn && !chatStillOpen && !isApplyButtonStillOnPage()) {
+    await sleep(1500);
+    ready = await waitForExternalOrNormalApply(4000);
+    applyStillThere = Boolean(ready.apply ?? findNaukriApplyButtonSync());
+    companySiteBtn = ready.external ?? findExternalApplyControl();
+    chatStillOpen = pageHasRecruiterChatbot() || Boolean(getNaukriQuestionModal()) || Boolean(findNaukriChatInput(document));
+  }
+
+  if (openCount >= NAUKRI_MAX_JOB_OPENS - 1 && !applyStillThere && !companySiteBtn && !chatStillOpen && !isApplyButtonStillOnPage()) {
     skipNaukriJobAndAdvance(state, `Repeated open after error — skipped (${openCount} opens)`, listingUrl);
     return;
   }
-  if (openCount >= 4 && applyStillThere) {
+
+  // Still applyable after prior opens — click Apply, do not skip
+  if (openCount >= 2 && (applyStillThere || chatStillOpen || companySiteBtn)) {
     emit({
       status: 'searching',
       jobTitle,
       company,
-      reason: 'Apply still available after prior opens — clicking Apply...',
-    });
-  }
-  if (openCount >= 4 && chatStillOpen) {
-    emit({
-      status: 'searching',
-      jobTitle,
-      company,
-      reason: 'Questions still open after prior opens — continuing answers...',
+      reason: applyStillThere
+        ? 'Apply still available after prior opens — clicking Apply...'
+        : chatStillOpen
+          ? 'Questions still open after prior opens — continuing answers...'
+          : 'Company-site Apply still available — capturing...',
     });
   }
 
@@ -4145,8 +5015,26 @@ async function applyOnNaukriDetailPage(profile: Profile, state: NaukriRunState):
     return;
   }
 
+  // Naukri already holds an application for this job (409xxx) — it succeeded, count it once
+  if (detectNaukriAlreadyAppliedCode()) {
+    emit({
+      status: 'searching',
+      jobTitle,
+      company,
+      reason: 'Naukri reports this job as already applied — counting it as applied',
+    });
+    await finalizeNaukriApplication(state);
+    return;
+  }
+
+  // Incomplete apply redirect (multiApplyResp 406) — never count as Applied
+  if (detectNaukriApplyRejected()) {
+    skipNaukriJobAndAdvance(state, naukriApplyRejectionReason(), listingUrl);
+    return;
+  }
+
   // Landed on success/confirmation page after Apply navigation (often /myapply, not green Applied)
-  if (detectNaukriApplySuccess() || isNaukriApplyConfirmationPage()) {
+  if (isNaukriApplyConfirmationPage() || (detectNaukriApplySuccess() && !naukriRecruiterQuestionsPending())) {
     emit({
       status: 'searching',
       jobTitle,
@@ -4195,10 +5083,63 @@ async function applyOnNaukriDetailPage(profile: Profile, state: NaukriRunState):
     }
   }
 
-  // Critical: never soft-return on duplicate claim — that freezes on the same job forever
+  // Critical: never soft-return on duplicate claim — that freezes on the same job forever.
+  // BUT if questions are already open (script re-entry / SPA), continue answering — do NOT skip.
   if (!claimPage(state.runId, 'detail', state.currentDetailUrl || listingUrl || currentUrl)) {
-    skipNaukriJobAndAdvance(state, 'Duplicate detail handler — moving to next job', listingUrl);
-    return;
+    const chatOpen = pageHasRecruiterChatbot() || Boolean(getNaukriQuestionModal()) || Boolean(findNaukriChatInput(document));
+    const postApply = sessionStorage.getItem(`job-autoapply-post-apply-${state.runId}`) === '1';
+    if (chatOpen || postApply) {
+      emit({
+        status: 'searching',
+        jobTitle,
+        company,
+        reason: 'Resume answering recruiter questions (detail already claimed)...',
+      });
+      sessionStorage.setItem(`job-autoapply-post-apply-${state.runId}`, '1');
+      const outcome = await waitForApplyOutcome(profile, 45000, jobTitle, company);
+      if (outcome === 'applied' || detectNaukriApplySuccess() || headerShowsAppliedBadge() || naukriPrimaryApplyLooksApplied()) {
+        await finalizeNaukriApplication(state);
+        return;
+      }
+      if (chatOpen || pageHasRecruiterChatbot() || getNaukriQuestionModal()) {
+        skipNaukriJobAndAdvance(
+          state,
+          'Could not finish recruiter questions — skipped (not reopening)',
+          listingUrl,
+        );
+        return;
+      }
+      // Fall through only if Apply is still available for a fresh click
+      releasePageClaim();
+      claimPage(state.runId, 'detail', state.currentDetailUrl || listingUrl || currentUrl, true);
+    } else if (isNaukriJobHandled(state, listingUrl, jobTitle, company)) {
+      releasePageClaim();
+      returnToNaukriSearch(state, state.jobIndex + 1);
+      return;
+    } else {
+      // Soft advance without a second skip lead when another handler is mid-flight
+      emit({
+        status: 'searching',
+        jobTitle,
+        company,
+        reason: 'Another detail handler is active — waiting...',
+      });
+      await sleep(2500);
+      if (pageHasRecruiterChatbot() || getNaukriQuestionModal() || findNaukriChatInput(document)) {
+        sessionStorage.setItem(`job-autoapply-post-apply-${state.runId}`, '1');
+        const outcome = await waitForApplyOutcome(profile, 40000, jobTitle, company);
+        if (outcome === 'applied' || detectNaukriApplySuccess() || headerShowsAppliedBadge()) {
+          await finalizeNaukriApplication(state);
+          return;
+        }
+      }
+      if (isNaukriJobHandled(state, listingUrl, jobTitle, company)) {
+        returnToNaukriSearch(state, state.jobIndex + 1);
+        return;
+      }
+      releasePageClaim();
+      claimPage(state.runId, 'detail', state.currentDetailUrl || listingUrl || currentUrl, true);
+    }
   }
 
   if (isNaukriJobHandled(state, currentUrl, jobTitle, company) || isNaukriJobHandled(state, state.currentDetailUrl, jobTitle, company)) {
@@ -4287,6 +5228,9 @@ async function proceedWithNormalApply(
     return;
   }
 
+  // Set BEFORE click — Naukri can navigate/unload before the line after click runs
+  sessionStorage.setItem(`job-autoapply-post-apply-${state.runId}`, '1');
+
   const clickResult = await clickNaukriApplyButton(applyBtn);
 
   if (clickResult === 'site-error') {
@@ -4335,10 +5279,23 @@ async function proceedWithNormalApply(
     return;
   }
 
-  sessionStorage.setItem(`job-autoapply-post-apply-${state.runId}`, '1');
-  emit({ status: 'searching', jobTitle, company, reason: 'Apply clicked — waiting for confirmation...' });
+  // Give the recruiter chat time to render — deciding too early is what closed chats mid-question
+  emit({ status: 'searching', jobTitle, company, reason: 'Apply clicked — waiting for questions or confirmation...' });
+  const waitStart = Date.now();
+  while (Date.now() - waitStart < 15000 && !isStopped()) {
+    if (pageHasRecruiterChatbot() || getNaukriQuestionModal() || findNaukriChatInput(document)) {
+      // Let the first question paint fully before any interaction
+      await sleep(1200);
+      break;
+    }
+    if (detectNaukriApplySuccess() || headerShowsAppliedBadge() || naukriPrimaryApplyLooksApplied()) {
+      await finalizeNaukriApplication(state);
+      return;
+    }
+    await sleep(600);
+  }
 
-  const outcome = await waitForApplyOutcome(profile, 30000, jobTitle, company);
+  const outcome = await waitForApplyOutcome(profile, 120000, jobTitle, company);
 
   if (outcome === 'applied') {
     await finalizeNaukriApplication(state);
@@ -4351,10 +5308,13 @@ async function proceedWithNormalApply(
   }
 
   if (
-    detectNaukriApplySuccess()
-    || isNaukriApplyConfirmationPage()
-    || headerShowsAppliedBadge()
-    || naukriPrimaryApplyLooksApplied()
+    !naukriRecruiterQuestionsPending()
+    && (
+      detectNaukriApplySuccess()
+      || isNaukriApplyConfirmationPage()
+      || headerShowsAppliedBadge()
+      || naukriPrimaryApplyLooksApplied()
+    )
   ) {
     emit({
       status: 'searching',
@@ -4366,8 +5326,8 @@ async function proceedWithNormalApply(
     return;
   }
 
-  // Left job detail for a non-search confirmation URL
-  if (!isNaukriJobDetailPage() && !isNaukriSearchPage()) {
+  // Left job detail for a verified confirmation URL only
+  if (!isNaukriJobDetailPage() && !isNaukriSearchPage() && isNaukriApplyConfirmationPage()) {
     emit({
       status: 'searching',
       jobTitle,
@@ -4379,9 +5339,9 @@ async function proceedWithNormalApply(
   }
 
   // Click registered (chat opened) but confirmation lagged — keep answering / waiting
-  if (pageHasRecruiterChatbot() || getNaukriQuestionModal() || findNaukriChatInput(document)) {
+  if (pageHasRecruiterChatbot() || getNaukriQuestionModal() || findNaukriChatInput(document) || naukriRecruiterQuestionsPending()) {
     emit({ status: 'searching', jobTitle, company, reason: 'Questions still open — continuing...' });
-    const late = await waitForApplyOutcome(profile, 20000, jobTitle, company);
+    const late = await waitForApplyOutcome(profile, 45000, jobTitle, company);
     if (late === 'applied') {
       await finalizeNaukriApplication(state);
       return;
@@ -4390,11 +5350,20 @@ async function proceedWithNormalApply(
       skipNaukriJobAndAdvance(state, 'already applied to this company', currentUrl);
       return;
     }
+    // Still on questions → skip once with clear reason (do not return to list and reopen)
+    if (pageHasRecruiterChatbot() || getNaukriQuestionModal() || findNaukriChatInput(document) || naukriRecruiterQuestionsPending()) {
+      skipNaukriJobAndAdvance(
+        state,
+        'Could not finish recruiter questions — skipped (not reopening)',
+        currentUrl,
+      );
+      return;
+    }
   }
 
   // Apply button still visible = application never went through
   if (isApplyButtonStillOnPage() && !naukriPrimaryApplyLooksApplied()) {
-    skipNaukriJobAndAdvance(state, 'Apply did not register — button still available', currentUrl);
+    skipNaukriJobAndAdvance(state, 'Apply did not complete — button still available', currentUrl);
     return;
   }
 
@@ -4403,10 +5372,18 @@ async function proceedWithNormalApply(
     return;
   }
 
-  skipNaukriJobAndAdvance(state, 'could not confirm application', currentUrl);
+  skipNaukriJobAndAdvance(state, 'could not confirm application (no thank-you / success page)', currentUrl);
 }
 
 async function runNaukri(profile: Profile, criteria: SearchCriteria): Promise<void> {
+  if (isExternalPauseActive()) {
+    emit({
+      status: 'searching',
+      reason: 'Paused — waiting for company website tab to finish before next job',
+    });
+    return;
+  }
+
   if (isNaukriErrorPage()) {
     const recoverKey = `job-autoapply-404-recover-${currentRunId || 'x'}`;
     const state = loadNaukriState();
@@ -4538,6 +5515,15 @@ async function runNaukri(profile: Profile, criteria: SearchCriteria): Promise<vo
 
   emit({ status: 'searching', reason: `Found ${cards.length} jobs — opening postings one by one...` });
 
+  // Company-site tab still open — one job at a time, so wait for the user to close it
+  if (isExternalPauseActive(state.runId)) {
+    emit({
+      status: 'searching',
+      reason: 'Paused — waiting for company website tab to finish before next job',
+    });
+    return;
+  }
+
   // Always scan the full visible list for the next UNHANDLED job (index cursor alone caused reopen loops)
   let opened = false;
   for (let i = 0; i < cards.length && !isStopped(); i++) {
@@ -4582,15 +5568,28 @@ async function runNaukri(profile: Profile, criteria: SearchCriteria): Promise<vo
     }
 
     const openCount = Number(sessionStorage.getItem(`job-autoapply-open-count-${normalizedDetailUrl}`) || '0');
-    // High bar — never skip a still-viable posting just because opens accumulated while answering chat
-    if (openCount >= 8) {
-      state.jobTitle = jobTitle;
-      state.company = company;
-      state.currentDetailUrl = normalizedDetailUrl;
-      markJobProcessed(state, normalizedDetailUrl);
-      state.counts.skipped++;
-      recordSkippedLead(jobTitle, company, 'Already attempted this job — skipping', normalizedDetailUrl);
-      emit({ status: 'skipped', jobTitle, company, reason: 'Already attempted this job — skipping' });
+    const skipAlreadyRecorded = sessionStorage.getItem(`job-autoapply-skip-recorded-${normalizedDetailUrl}`) === '1';
+    // Cap reopen attempts — silent if already skipped/processed (no duplicate report row)
+    if (openCount >= NAUKRI_MAX_JOB_OPENS || skipAlreadyRecorded) {
+      if (!isNaukriJobHandled(state, normalizedDetailUrl, jobTitle, company)) {
+        markJobProcessed(state, normalizedDetailUrl);
+        if (!skipAlreadyRecorded) {
+          state.counts.skipped++;
+          recordSkippedLead(
+            jobTitle,
+            company,
+            'Already attempted this job — skipping after multiple attempts',
+            normalizedDetailUrl,
+          );
+          sessionStorage.setItem(`job-autoapply-skip-recorded-${normalizedDetailUrl}`, '1');
+          emit({
+            status: 'skipped',
+            jobTitle,
+            company,
+            reason: 'Already attempted this job — skipping after multiple attempts',
+          });
+        }
+      }
       state.jobIndex = i + 1;
       saveNaukriState(state);
       continue;
@@ -6351,6 +7350,14 @@ async function runLinkedIn(profile: Profile, criteria: SearchCriteria): Promise<
       state.counts.applied++;
       saveLinkedInState(state);
       emitLinkedInCounters(state.counts);
+      recordExternalApplyLead({
+        jobTitle,
+        company,
+        naukriUrl: listingUrl,
+        skipReason: 'Applied',
+        sourceType: 'applied',
+        capturedAt: new Date().toISOString(),
+      });
       emit({ status: 'applied', jobTitle, company });
       await dismissLinkedInPostApplyOverlay();
       if (state.counts.applied >= state.criteria.dailyApplicationCap) {
@@ -6483,6 +7490,14 @@ async function resumePendingRun(_force = false): Promise<void> {
     haltAutomationLocally();
     return;
   }
+  // Company-site tab still open — stay parked even for forced resumes
+  if (isExternalPauseActive()) {
+    emit({
+      status: 'searching',
+      reason: 'Paused — waiting for company website tab to finish before next job',
+    });
+    return;
+  }
   // Finished runs must never restart via force-resume
   const finishedKey = `job-autoapply-finished-${currentRunId || loadNaukriState()?.runId || loadLinkedInState()?.runId || 'none'}`;
   if (sessionStorage.getItem(finishedKey) === '1') {
@@ -6542,6 +7557,37 @@ async function resumePendingRun(_force = false): Promise<void> {
       releasePageClaim();
       sessionStorage.removeItem(EXEC_KEY);
 
+      // Already applied (409xxx) — the application went through, never report it as rejected
+      if (detectNaukriAlreadyAppliedCode()) {
+        emit({
+          status: 'searching',
+          jobTitle: naukriState.jobTitle,
+          company: naukriState.company,
+          reason: 'Naukri reports this job as already applied — counting it as applied',
+        });
+        await finalizeNaukriApplication(naukriState);
+        return;
+      }
+
+      // saveApply with multiApplyResp 406 / Oops incomplete — skip, do NOT count Applied
+      if (detectNaukriApplyRejected()) {
+        if (!naukriState.jobTitle) {
+          naukriState.jobTitle = naukriJobTitleFromApplyUrl(window.location.href) ?? undefined;
+        }
+        skipNaukriJobAndAdvance(
+          naukriState,
+          naukriApplyRejectionReason(),
+          naukriState.currentDetailUrl,
+        );
+        return;
+      }
+
+      // saveApply with multiApplyResp 200 / green Applied banner
+      if (detectNaukriApplyAcceptedPage() || (parseNaukriMultiApplyResp()?.code === 200)) {
+        await finalizeNaukriApplication(naukriState);
+        return;
+      }
+
       if (isNaukriCompanySiteConfirmationPage()) {
         if (detectNaukriApplySuccess() || headerShowsAppliedBadge()) {
           await finalizeNaukriApplication(naukriState);
@@ -6599,10 +7645,32 @@ async function resumePendingRun(_force = false): Promise<void> {
           return;
         }
 
-        // Bounced to list without Apply — advance index only. Do NOT skip as "repeated open"
-        // (that skipped simple-Apply jobs that never got a real click).
+        // Bounced to list without finishing Apply — REOPEN the job to finish questions /
+        // capture company-site. Do NOT skip here (that abandoned Mirafra/Yash mid-flow).
         if (naukriState.phase === 'detail' && naukriState.currentDetailUrl && !postApplyFlag) {
-          naukriState.jobIndex += 1;
+          const bouncedUrl = naukriState.currentDetailUrl;
+          const normalizedBounce = normalizeJobUrl(bouncedUrl);
+          const openCount = Number(sessionStorage.getItem(`job-autoapply-open-count-${normalizedBounce}`) || '0');
+          if (openCount < 4 && !isNaukriJobHandled(naukriState, bouncedUrl, naukriState.jobTitle, naukriState.company)) {
+            emit({
+              status: 'searching',
+              jobTitle: naukriState.jobTitle,
+              company: naukriState.company,
+              reason: 'Returned to list early — reopening job to finish Apply / company site...',
+            });
+            naukriState.phase = 'detail';
+            saveNaukriState(naukriState);
+            noteNaukriDetailAttempt(normalizedBounce);
+            window.location.href = bouncedUrl;
+            return;
+          }
+          // Exhausted retries — skip once (deduped)
+          skipNaukriJobAndAdvance(
+            naukriState,
+            'Could not finish job after reopen attempts — skipped',
+            bouncedUrl,
+          );
+          return;
         }
 
         sessionStorage.removeItem(`job-autoapply-external-pending-${naukriState.runId}`);
@@ -6948,6 +8016,9 @@ function clickModalClose(dialog: HTMLElement): boolean {
 }
 
 function dismissNaukriOverlayModals(): void {
+  // An open recruiter chat must never be closed by overlay cleanup or a stray Escape
+  if (isNaukriChatOpen()) return;
+
   for (const dialog of document.querySelectorAll<HTMLElement>(
     '[role="dialog"], [class*="modal" i], [class*="Modal"], [class*="overlay" i], [class*="popup" i]',
   )) {
@@ -7617,6 +8688,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     };
     // Do not emit interrupted here — background finishStop broadcasts once
     finish(counts);
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message.type === 'EXTERNAL_TAB_CLOSED') {
+    const runId = message.payload?.runId as string | undefined;
+    clearExternalPause(runId);
+    sessionStorage.removeItem(`job-autoapply-external-pending-${runId || currentRunId || 'none'}`);
+    emit({
+      status: 'searching',
+      reason: 'Returned from company website — continuing with the next job...',
+    });
+    // Background already navigates back to search and resumes; this is a safety fallback
+    setTimeout(() => {
+      if (!automationActive && !isStopped() && !isExternalPauseActive()) void resumePendingRun(true);
+    }, 5000);
     sendResponse({ ok: true });
     return true;
   }
