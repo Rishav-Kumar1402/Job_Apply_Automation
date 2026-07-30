@@ -67,6 +67,8 @@ export const profileSchema = z.object({
   graduationPercentage: z.number().min(0).max(100).optional(),
   /** CGPA on a 10-point scale (e.g. 8.5) */
   cgpa: z.number().min(0).max(10).optional(),
+  /** Date of birth as YYYY-MM-DD — recruiter chatbots ask for it directly */
+  dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD').optional(),
   /** Last resume headline pushed to / saved for Naukri profile */
   naukriResumeHeadline: z.string().max(250).optional(),
 });

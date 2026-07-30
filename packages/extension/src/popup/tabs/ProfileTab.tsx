@@ -13,6 +13,7 @@ import { useAppStore } from '../store';
 import { ResumeUpload } from '../components/ResumeUpload';
 import { NaukriProfileUpdatePanel } from '../components/NaukriProfileUpdatePanel';
 import { SecretNumberInput } from '../components/SecretNumberInput';
+import { SecretTextInput } from '../components/SecretTextInput';
 
 const emptyProfile = (): Profile => ({
   fullName: '',
@@ -80,6 +81,7 @@ export function ProfileTab({ onLocked }: { onLocked?: () => void }) {
       noticePeriod: form.noticePeriod || undefined,
       expectedCTC: form.expectedCTC || undefined,
       currentCTC: form.currentCTC || undefined,
+      dateOfBirth: form.dateOfBirth?.trim() || undefined,
       percentage10th: form.percentage10th || undefined,
       percentage12th: form.percentage12th || undefined,
       graduationPercentage: form.graduationPercentage || undefined,
@@ -257,6 +259,16 @@ export function ProfileTab({ onLocked }: { onLocked?: () => void }) {
               onChange={(v) => update('currentCTC', v as Profile['currentCTC'])}
               placeholder="e.g. 8"
             />
+          </div>
+          <div className="col-span-2">
+            <label>Date of Birth</label>
+            <SecretTextInput
+              type="date"
+              value={form.dateOfBirth}
+              onChange={(v) => update('dateOfBirth', v as Profile['dateOfBirth'])}
+              placeholder="YYYY-MM-DD"
+            />
+            <p className="mt-1 text-xs text-muted">Used when a recruiter chat asks for your DOB.</p>
           </div>
           <div className="col-span-2">
             <label>Notice Period</label>

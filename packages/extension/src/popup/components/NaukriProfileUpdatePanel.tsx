@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { Profile, ResumeFile } from '@job-autoapply/shared';
+import { STORAGE_KEYS, type Profile, type ResumeFile } from '@job-autoapply/shared';
 import { readResumeFile, saveProfile } from '../../lib/storage';
 import { ResumeUpload } from './ResumeUpload';
 import { useAppStore } from '../store';
@@ -42,8 +42,19 @@ export function NaukriProfileUpdatePanel({ profile, onProfileUpdated }: NaukriPr
   runIdRef.current = runId;
 
   useEffect(() => {
-    setHeadline(profile?.naukriResumeHeadline ?? '');
+    const saved = profile?.naukriResumeHeadline ?? '';
+    if (saved) setHeadline(saved);
   }, [profile?.naukriResumeHeadline]);
+
+  // The encrypted profile may be locked or missing the headline — the plain copy always has
+  // the last one pushed to Naukri.
+  useEffect(() => {
+    chrome.storage.local.get([STORAGE_KEYS.lastNaukriHeadline], (stored) => {
+      if (chrome.runtime.lastError) return;
+      const last = stored?.[STORAGE_KEYS.lastNaukriHeadline] as string | undefined;
+      if (last) setHeadline((current) => (current.trim() ? current : last));
+    });
+  }, []);
 
   useEffect(() => () => {
     if (collapseTimerRef.current) clearTimeout(collapseTimerRef.current);
@@ -160,6 +171,16 @@ export function NaukriProfileUpdatePanel({ profile, onProfileUpdated }: NaukriPr
     setStatusOpen(true);
 
     try {
+      if (updateHeadline && headline.trim()) {
+        // Always keep the plain copy current so the field is prefilled on the next open,
+        // even when the encrypted profile is locked.
+        try {
+          await chrome.storage.local.set({ [STORAGE_KEYS.lastNaukriHeadline]: headline.trim() });
+        } catch {
+          // continue — the headline still goes to Naukri
+        }
+      }
+
       if (profile && updateHeadline && headline.trim() !== (profile.naukriResumeHeadline ?? '')) {
         const next = { ...profile, naukriResumeHeadline: headline.trim() };
         try {

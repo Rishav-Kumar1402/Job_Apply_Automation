@@ -29,4 +29,6 @@ export const STORAGE_KEYS = {
   uiPreferences: 'uiPreferences',
   tosAcknowledged: 'tosAcknowledged',
   hostConnected: 'hostConnected',
+  /** Last headline pushed to Naukri — plain local so it survives a locked profile. */
+  lastNaukriHeadline: 'lastNaukriHeadline',
 } as const;

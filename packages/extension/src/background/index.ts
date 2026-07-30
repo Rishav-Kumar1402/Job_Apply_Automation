@@ -211,6 +211,80 @@ function externalLeadKey(lead: ExternalCompanyLead): string {
   return `${lead.naukriUrl}|${lead.company}|${lead.jobTitle}`;
 }
 
+/**
+ * Naukri sometimes sends the Apply click straight offsite in the same tab, with no company-site
+ * button for the content script to recognise. The content script dies with that navigation, so
+ * the job would otherwise be reopened until the attempt budget ran out. The background keeps
+ * just enough context to record the lead and put the run back on the list.
+ */
+const currentJobContext: { jobTitle?: string; company?: string; naukriUrl?: string } = {};
+let lastNaukriListUrl: string | null = null;
+let lastOffsiteDriftAt = 0;
+
+function isNaukriJobPostingUrl(url: string | undefined): boolean {
+  if (!url || !isNaukriUrl(url)) return false;
+  const lower = url.toLowerCase();
+  return lower.includes('job-listings') || lower.includes('job-details');
+}
+
+function isNaukriSearchListUrl(url: string | undefined): boolean {
+  if (!url || !isNaukriUrl(url)) return false;
+  if (isNaukriJobPostingUrl(url)) return false;
+  const lower = url.toLowerCase();
+  return lower.includes('-jobs') || lower.includes('/jobs') || lower.includes('k=');
+}
+
+function handleUntrackedOffsiteDrift(tabId: number, externalUrl: string): void {
+  // Redirect chains fire several times — one lead and one return per drift is enough
+  if (Date.now() - lastOffsiteDriftAt < 20000) return;
+  lastOffsiteDriftAt = Date.now();
+
+  const jobTitle = currentJobContext.jobTitle || 'Unknown';
+  const company = currentJobContext.company || 'Unknown';
+
+  addExternalLead({
+    runId: runState.runId ?? undefined,
+    jobTitle,
+    company,
+    naukriUrl: currentJobContext.naukriUrl || 'Not captured',
+    externalUrl,
+    skipReason: 'Apply on company site',
+    sourceType: 'company-site',
+    capturedAt: new Date().toISOString(),
+  });
+
+  broadcastAutomationEvent({
+    type: 'STATUS_EVENT',
+    runId: runState.runId,
+    status: 'searching',
+    jobTitle,
+    company,
+    reason: 'Apply went to the company website — link captured, returning to the job list...',
+  });
+
+  const returnUrl = lastNaukriListUrl;
+  const handledUrl = currentJobContext.naukriUrl;
+  // Let the company page settle so the final (post-redirect) URL is the one captured
+  setTimeout(() => {
+    if (!runState.isRunning) return;
+    if (!returnUrl) {
+      resumeAutomationTab(tabId, 0, true);
+      return;
+    }
+    chrome.tabs.update(tabId, { url: returnUrl, active: true }).then(() => {
+      const markHandled = () => {
+        chrome.tabs.sendMessage(tabId, {
+          type: 'MARK_JOB_HANDLED',
+          payload: { runId: runState.runId, naukriUrl: handledUrl },
+        }).catch(() => {});
+      };
+      setTimeout(markHandled, 1500);
+      setTimeout(markHandled, 3500);
+      resumeAutomationTab(tabId, 4500, false);
+    }).catch(() => {});
+  }, 4000);
+}
+
 function findRecentPendingExternal(): PendingExternalWatch | null {
   const now = Date.now();
   const pending = [...pendingExternalWatches.values()]
@@ -361,10 +435,12 @@ function returnSourceToSearch(pending: PendingExternalWatch): void {
     return;
   }
   chrome.tabs.update(pending.sourceTabId, { url: target, active: true }).then(() => {
-    // Naukri SPA often needs a second kick after the loader finishes
-    resumeAutomationTab(pending.sourceTabId, 1200, true);
-    resumeAutomationTab(pending.sourceTabId, 3500, true);
-    resumeAutomationTab(pending.sourceTabId, 7000, true);
+    // Naukri SPA often needs a second kick after the loader finishes. Only the first kick is
+    // forced — later forced kicks aborted the pass mid-navigation and the job it was opening
+    // looked like it had bounced back to the list.
+    resumeAutomationTab(pending.sourceTabId, 1500, true);
+    resumeAutomationTab(pending.sourceTabId, 4500, false);
+    resumeAutomationTab(pending.sourceTabId, 9000, false);
   }).catch(() => {});
 }
 
@@ -849,7 +925,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       status?: string;
       runId?: string;
       reason?: string;
+      jobTitle?: string;
+      company?: string;
     };
+    if (payload?.type === 'STATUS_EVENT' && (payload.jobTitle || payload.company)) {
+      currentJobContext.jobTitle = payload.jobTitle ?? currentJobContext.jobTitle;
+      currentJobContext.company = payload.company ?? currentJobContext.company;
+    }
     // Ignore stop acks from iframes / secondary tabs — background emits one canonical stop event
     if (
       payload?.type === 'STATUS_EVENT'
@@ -1874,6 +1956,26 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     return;
   }
 
+  // Remember where the run is on Naukri so an offsite drift can be undone
+  if (visibleUrl && runState.isRunning && runState.tabId === tabId && isNaukriUrl(visibleUrl)) {
+    if (isNaukriJobPostingUrl(visibleUrl)) currentJobContext.naukriUrl = visibleUrl;
+    else if (isNaukriSearchListUrl(visibleUrl)) lastNaukriListUrl = visibleUrl;
+  }
+
+  // Apply navigated the automation tab offsite with no company-site watch — record it and
+  // return, otherwise the job is reopened until the attempt budget is exhausted.
+  if (
+    runState.isRunning
+    && runState.mode !== 'naukri-profile'
+    && runState.tabId === tabId
+    && !pendingExternal
+    && !isExternalPauseActive()
+    && isExternalCandidateUrl(visibleUrl)
+  ) {
+    handleUntrackedOffsiteDrift(tabId, visibleUrl);
+    return;
+  }
+
   // Capture company URLs only on non-job-board tabs
   if (!isJobBoardUrl(visibleUrl) && !isAutomationSource) {
     attachExternalUrlToPendingTab(tabId, visibleUrl);
@@ -1895,9 +1997,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status !== 'complete') return;
   if (!runState.isRunning || runState.tabId !== tabId) return;
 
-  // Always resume the automation tab — never block on leftover external watches
+  // Always resume the automation tab — never block on leftover external watches. Only the
+  // first kick is forced; a forced kick aborts the pass that is already handling this page.
   resumeAutomationTab(tabId, 700, true);
-  resumeAutomationTab(tabId, 2500, true);
+  resumeAutomationTab(tabId, 2500, false);
 });
 
 function handleExternalNavigation(details: chrome.webNavigation.WebNavigationFramedCallbackDetails): void {

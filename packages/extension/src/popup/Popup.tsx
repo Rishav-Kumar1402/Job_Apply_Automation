@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import {
   getStorageStatus,
   loadProfile,
@@ -31,11 +31,14 @@ export function Popup() {
   const profileTabDisabled = isRunning && runMode === 'apply';
   const otherTabsDisabled = isRunning && runMode === 'naukri-profile';
 
+  /** The passphrase is asked once per opened UI, even if the worker still holds the key. */
+  const unlockedHereRef = useRef(false);
+
   const refreshGate = useCallback(async () => {
     const status = await getStorageStatus();
     if (!status.hasSetup) {
       setGate('setup');
-    } else if (!status.isUnlocked) {
+    } else if (!status.isUnlocked || !unlockedHereRef.current) {
       setGate('unlock');
     } else {
       setLockMessage(undefined);
@@ -97,7 +100,10 @@ export function Popup() {
         <UnlockScreen
           mode={gate}
           message={lockMessage}
-          onUnlocked={() => refreshGate()}
+          onUnlocked={() => {
+            unlockedHereRef.current = true;
+            void refreshGate();
+          }}
         />
       </div>
     );
@@ -182,6 +188,7 @@ export function Popup() {
       {activeTab === 'profile' && (
         <ProfileTab
           onLocked={() => {
+            unlockedHereRef.current = false;
             setLockMessage('Your session expired. Enter your passphrase to save your profile.');
             setGate('unlock');
           }}

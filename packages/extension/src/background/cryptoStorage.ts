@@ -13,6 +13,42 @@ const IV_BYTES = 12;
 /** In-memory only — cleared when the last extension UI port disconnects. */
 let cachedKey: CryptoKey | null = null;
 
+/**
+ * MV3 service workers are killed after ~30s idle, which used to wipe the derived key while
+ * the popup was still open ("Your session expired" on every save). The key is mirrored into
+ * chrome.storage.session (memory-only, trusted contexts, wiped on browser close) so it
+ * survives worker restarts; locking still removes it, so the passphrase is asked per session.
+ */
+const SESSION_KEY_ID = 'sessionDerivedKey';
+
+async function persistSessionKey(key: CryptoKey): Promise<void> {
+  try {
+    const raw = await crypto.subtle.exportKey('raw', key);
+    await chrome.storage.session.set({ [SESSION_KEY_ID]: bufferToBase64(raw) });
+  } catch {
+    // Session storage unavailable — fall back to in-memory only
+  }
+}
+
+async function restoreSessionKey(): Promise<CryptoKey | null> {
+  if (cachedKey) return cachedKey;
+  try {
+    const stored = await chrome.storage.session.get([SESSION_KEY_ID] as string[]);
+    const raw = stored[SESSION_KEY_ID] as string | undefined;
+    if (!raw) return null;
+    cachedKey = await crypto.subtle.importKey(
+      'raw',
+      base64ToBuffer(raw),
+      { name: 'AES-GCM' },
+      true,
+      ['encrypt', 'decrypt'],
+    );
+    return cachedKey;
+  } catch {
+    return null;
+  }
+}
+
 function bufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
   let binary = '';
@@ -64,6 +100,7 @@ async function getOrCreateSalt(): Promise<Uint8Array> {
 
 export async function getStorageStatus(): Promise<{ hasSetup: boolean; isUnlocked: boolean }> {
   const hasSetup = await hasEncryptionSetup();
+  if (!cachedKey) await restoreSessionKey();
   return { hasSetup, isUnlocked: cachedKey !== null };
 }
 
@@ -80,6 +117,7 @@ export async function setupEncryption(passphrase: string): Promise<void> {
   const salt = await getOrCreateSalt();
   const key = await deriveKey(passphrase, salt as BufferSource);
   cachedKey = key;
+  await persistSessionKey(key);
 
   const enc = new TextEncoder();
   const checkIv = crypto.getRandomValues(new Uint8Array(IV_BYTES));
@@ -120,6 +158,7 @@ export async function unlockWithPassphrase(passphrase: string): Promise<boolean>
     const text = new TextDecoder().decode(dec);
     if (text === 'job-autoapply-key-check') {
       cachedKey = key;
+      await persistSessionKey(key);
       return true;
     }
   } catch {
@@ -130,19 +169,19 @@ export async function unlockWithPassphrase(passphrase: string): Promise<boolean>
 
 export async function lockStorage(): Promise<void> {
   cachedKey = null;
-  // Clear any key left from older builds that persisted unlock across UI closes.
   try {
-    await chrome.storage.session.remove('sessionDerivedKey');
+    await chrome.storage.session.remove(SESSION_KEY_ID);
   } catch {
     // ignore
   }
 }
 
 async function getKey(): Promise<CryptoKey> {
-  if (!cachedKey) {
+  const key = cachedKey ?? (await restoreSessionKey());
+  if (!key) {
     throw new Error('Storage is locked. Enter your passphrase to unlock.');
   }
-  return cachedKey;
+  return key;
 }
 
 export async function saveProfile(profile: Profile): Promise<void> {
