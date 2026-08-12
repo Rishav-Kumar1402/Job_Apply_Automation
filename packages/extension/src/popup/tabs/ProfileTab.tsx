@@ -82,6 +82,8 @@ export function ProfileTab({ onLocked }: { onLocked?: () => void }) {
       expectedCTC: form.expectedCTC || undefined,
       currentCTC: form.currentCTC || undefined,
       dateOfBirth: form.dateOfBirth?.trim() || undefined,
+      linkedinProfileUrl: form.linkedinProfileUrl?.trim() || undefined,
+      portfolioUrl: form.portfolioUrl?.trim() || undefined,
       percentage10th: form.percentage10th || undefined,
       percentage12th: form.percentage12th || undefined,
       graduationPercentage: form.graduationPercentage || undefined,
@@ -211,6 +213,25 @@ export function ProfileTab({ onLocked }: { onLocked?: () => void }) {
 
       <div className="section-card space-y-3">
         <h3 className="text-sm font-medium">LinkedIn</h3>
+        <div>
+          <label>LinkedIn Profile URL</label>
+          <input
+            value={form.linkedinProfileUrl ?? ''}
+            onChange={(e) => update('linkedinProfileUrl', e.target.value as Profile['linkedinProfileUrl'])}
+            placeholder="https://www.linkedin.com/in/your-handle"
+          />
+          <p className="mt-1 text-xs text-muted">
+            Easy Apply forms often make “LinkedIn*” a required field.
+          </p>
+        </div>
+        <div>
+          <label>Portfolio / GitHub URL</label>
+          <input
+            value={form.portfolioUrl ?? ''}
+            onChange={(e) => update('portfolioUrl', e.target.value as Profile['portfolioUrl'])}
+            placeholder="https://github.com/your-handle"
+          />
+        </div>
         <div>
           <label>Work Authorization *</label>
           <select

@@ -27,6 +27,8 @@ function externalLeadsToCsv(leads: ExternalCompanyLead[]): string {
     lead.skipReason
     ?? (lead.sourceType === 'applied'
       ? 'Applied'
+      : lead.sourceType === 'failed'
+        ? 'Failed'
       : lead.sourceType === 'company-site'
         ? 'Apply on company site'
         : 'Skipped');
@@ -250,16 +252,19 @@ export function RunDashboardTab() {
     { applied: 0, skipped: 0, failed: 0 },
   );
 
-  // Prefer content-script counters. Skipped never shows less than non-applied report rows.
-  const reportSkippedRows = externalLeads.filter((l) => l.sourceType !== 'applied').length;
-  const displayCounts = {
-    applied: runSummary?.applied ?? liveCounters?.applied ?? countsFromEvents.applied,
-    skipped: Math.max(
-      runSummary?.skipped ?? liveCounters?.skipped ?? countsFromEvents.skipped,
-      reportSkippedRows,
-    ),
-    failed: runSummary?.failed ?? liveCounters?.failed ?? countsFromEvents.failed,
-  };
+  // Report rows are deduplicated centrally and are the final authority. Counter messages can
+  // arrive out of order after overlapping content-script passes, which made the chips stale.
+  const reportCounts = externalLeads.reduce(
+    (acc, lead) => {
+      if (lead.sourceType === 'applied') acc.applied++;
+      else if (lead.sourceType === 'failed') acc.failed++;
+      else acc.skipped++;
+      return acc;
+    },
+    { applied: 0, skipped: 0, failed: 0 },
+  );
+  const fallbackCounts = runSummary ?? liveCounters ?? countsFromEvents;
+  const displayCounts = externalLeads.length > 0 ? reportCounts : fallbackCounts;
 
   const handleViewTab = () => {
     chrome.runtime.sendMessage({ type: 'FOCUS_AUTOMATION_TAB' });
@@ -359,8 +364,8 @@ export function RunDashboardTab() {
 
       {runSummary && !isRunning && (
         <div className="bg-black-100 text-sm p-3 rounded">
-          Run complete — {runSummary.applied} applied, {runSummary.skipped} skipped,{' '}
-          {runSummary.failed} failed.
+          Run complete — {displayCounts.applied} applied, {displayCounts.skipped} skipped,{' '}
+          {displayCounts.failed} failed.
         </div>
       )}
 
@@ -370,9 +375,11 @@ export function RunDashboardTab() {
             <div>
               <h3 className="text-sm font-semibold">Application Report</h3>
               <p className="text-xs text-muted">
-                {externalLeads.filter((l) => l.sourceType === 'applied').length} applied
+                {reportCounts.applied} applied
                 {' · '}
-                {externalLeads.filter((l) => l.sourceType !== 'applied').length} company-site / skipped
+                {reportCounts.skipped} company-site / skipped
+                {' · '}
+                {reportCounts.failed} failed
               </p>
             </div>
             <div className="flex gap-2">
@@ -403,6 +410,8 @@ export function RunDashboardTab() {
                       {lead.skipReason
                         ?? (lead.sourceType === 'applied'
                           ? 'Applied'
+                          : lead.sourceType === 'failed'
+                            ? 'Failed'
                           : lead.sourceType === 'company-site'
                             ? 'Apply on company site'
                             : 'Skipped')}

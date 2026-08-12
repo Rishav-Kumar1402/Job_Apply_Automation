@@ -48,7 +48,7 @@ export interface ExternalCompanyLead {
   naukriUrl: string;
   externalUrl?: string;
   skipReason?: string;
-  sourceType?: 'company-site' | 'skipped' | 'applied';
+  sourceType?: 'company-site' | 'skipped' | 'failed' | 'applied';
   capturedAt: string;
 }
 

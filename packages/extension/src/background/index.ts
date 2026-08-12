@@ -31,7 +31,7 @@ interface ExternalCompanyLead {
   naukriUrl: string;
   externalUrl?: string;
   skipReason?: string;
-  sourceType?: 'company-site' | 'skipped' | 'applied';
+  sourceType?: 'company-site' | 'skipped' | 'failed' | 'applied';
   capturedAt: string;
 }
 
@@ -89,6 +89,8 @@ const CONFIRMATION_WAIT_MS = 6000;
 const emailedReportRunIds = new Set<string>();
 /** Runs the user explicitly stopped — late content-script events must never revive them. */
 const stoppedRunIds = new Set<string>();
+/** Runs that already reported a summary (target reached / nothing left) — same rule. */
+const completedRunIds = new Set<string>();
 const emailJsConfig = {
   serviceId: import.meta.env.VITE_EMAILJS_SERVICE_ID as string | undefined,
   templateId: import.meta.env.VITE_EMAILJS_TEMPLATE_ID as string | undefined,
@@ -126,13 +128,15 @@ function toBase64Utf8(text: string): string {
 
 function leadStatusLabel(lead: ExternalCompanyLead): string {
   if (lead.sourceType === 'applied') return lead.skipReason || 'Applied';
+  if (lead.sourceType === 'failed') return lead.skipReason || 'Failed';
   if (lead.sourceType === 'company-site') return lead.skipReason || 'Apply on company site';
   return lead.skipReason || 'Skipped';
 }
 
 function leadsToHtmlTable(leads: ExternalCompanyLead[]): string {
   const applied = leads.filter((l) => l.sourceType === 'applied').length;
-  const other = leads.length - applied;
+  const failed = leads.filter((l) => l.sourceType === 'failed').length;
+  const skipped = leads.length - applied - failed;
   const rows = leads.map((lead, index) => {
     const reason = leadStatusLabel(lead);
     return `<tr>
@@ -151,7 +155,7 @@ function leadsToHtmlTable(leads: ExternalCompanyLead[]): string {
 
   return `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#111;">
     <h2>Job Auto-Apply report</h2>
-    <p>${applied} applied, ${other} company-site / skipped (${leads.length} total).</p>
+    <p>${applied} applied, ${skipped} company-site / skipped, ${failed} failed (${leads.length} total).</p>
     <table style="border-collapse:collapse;width:100%;font-size:13px;">
       <thead>
         <tr style="background:#f3f4f6;">
@@ -650,6 +654,8 @@ function broadcastAutomationEvent(payload: Record<string, unknown>): void {
   }
   if (payload.type === 'RUN_SUMMARY') {
     runState.isRunning = false;
+    const summaryRunId = (payload.runId as string | undefined) ?? runState.runId ?? undefined;
+    if (summaryRunId) completedRunIds.add(summaryRunId);
     runState.summary = {
       applied: (payload.applied as number) ?? 0,
       skipped: (payload.skipped as number) ?? 0,
@@ -686,7 +692,8 @@ function addExternalLead(lead: ExternalCompanyLead): void {
   if (existingIndex >= 0) {
     const prev = runState.externalLeads[existingIndex];
     // Prefer applied > company-site capture > generic skip
-    const rank = (t?: string) => (t === 'applied' ? 3 : t === 'company-site' ? 2 : 1);
+    const rank = (t?: string) =>
+      t === 'applied' ? 4 : t === 'failed' ? 3 : t === 'company-site' ? 2 : 1;
     const preferIncoming = rank(normalized.sourceType) > rank(prev.sourceType)
       || (normalized.externalUrl && !prev.externalUrl)
       || (!prev.skipReason && normalized.skipReason);
@@ -873,11 +880,12 @@ async function sendCompanySiteEmailReport(
 
   const subject = `Job Auto-Apply report (${reportLeads.length})`;
   const appliedCount = reportLeads.filter((l) => l.sourceType === 'applied').length;
-  const otherCount = reportLeads.length - appliedCount;
+  const failedCount = reportLeads.filter((l) => l.sourceType === 'failed').length;
+  const otherCount = reportLeads.length - appliedCount - failedCount;
   const textBody = [
     'Hi,',
     '',
-    `Here is the auto-apply report from the latest run (${appliedCount} applied, ${otherCount} company-site / skipped).`,
+    `Here is the auto-apply report from the latest run (${appliedCount} applied, ${otherCount} company-site / skipped, ${failedCount} failed).`,
     '',
     formatExternalLeadsTable(reportLeads),
     '',
@@ -950,6 +958,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       && payload.runId
       && payload.runId === runState.runId
       && !stoppedRunIds.has(payload.runId)
+      && !completedRunIds.has(payload.runId)
     ) {
       runState.isRunning = true;
     }
@@ -2263,6 +2272,7 @@ async function startAutomation(profile: Profile, criteria: SearchCriteria): Prom
   };
   emailedReportRunIds.clear();
   stoppedRunIds.clear();
+  completedRunIds.clear();
 
   const tab = await chrome.tabs.create({ url: searchUrl, active: true });
   if (!tab.id) return false;

@@ -460,14 +460,22 @@ function isNaukriDisclaimerOrNote(question: string): boolean {
     && !/^(are you|do you|have you|how many|what is|where|which)/i.test(q);
 }
 
-interface NaukriRunState {
+type RunOutcome = 'applied' | 'skipped' | 'failed';
+
+/** Counts are derived from this ledger, so one job can only ever contribute one outcome. */
+interface CountableRunState {
+  platform?: 'naukri' | 'linkedin';
+  counts: { applied: number; skipped: number; failed: number };
+  countedOutcomes?: Record<string, RunOutcome>;
+}
+
+interface NaukriRunState extends CountableRunState {
   platform?: 'naukri';
   runId: string;
   profile: Profile;
   criteria: SearchCriteria;
   phase: 'list' | 'detail';
   jobIndex: number;
-  counts: { applied: number; skipped: number; failed: number };
   jobTitle?: string;
   company?: string;
   processedDetailUrls: string[];
@@ -481,13 +489,12 @@ interface NaukriRunState {
   naukriJobAge?: 1 | 3 | 7;
 }
 
-interface LinkedInRunState {
+interface LinkedInRunState extends CountableRunState {
   platform: 'linkedin';
   runId: string;
   profile: Profile;
   criteria: SearchCriteria;
   jobIndex: number;
-  counts: { applied: number; skipped: number; failed: number };
   processedJobKeys: string[];
 }
 
@@ -497,7 +504,7 @@ interface ExternalCompanyLead {
   naukriUrl: string;
   externalUrl?: string;
   skipReason?: string;
-  sourceType?: 'company-site' | 'skipped' | 'applied';
+  sourceType?: 'company-site' | 'skipped' | 'failed' | 'applied';
   capturedAt: string;
 }
 
@@ -516,6 +523,110 @@ function naukriJobIdFromUrl(url: string): string | null {
 
 function naukriJobKey(jobTitle?: string, company?: string): string {
   return `${normalizeText(jobTitle || '')}|${normalizeText(company || '')}`;
+}
+
+/** LinkedIn listing URLs carry the posting id, which identifies the exact job. */
+function linkedInJobIdFromUrl(url?: string | null): string | null {
+  if (!url) return null;
+  const fromPath = url.match(/\/jobs\/view\/(\d+)/);
+  if (fromPath?.[1]) return fromPath[1];
+  const fromQuery = url.match(/currentJobId=(\d+)/);
+  return fromQuery?.[1] ?? null;
+}
+
+/**
+ * Identity used by the outcome ledger. It mirrors how the background deduplicates report rows
+ * (listing URL first, company + title as fallback) so the dashboard counters and the report can
+ * never disagree about how many jobs were applied to or skipped.
+ */
+function outcomeLedgerKey(
+  jobTitle?: string,
+  company?: string,
+  url?: string | null,
+  platform?: 'naukri' | 'linkedin',
+): string | null {
+  const title = normalizeText(jobTitle || '');
+  const org = normalizeText(company || '');
+  // Staffing firms post many distinct roles under one company and often reuse a title, so
+  // company+title would collapse several real applications into a single counted job and the
+  // run would sail past its target. LinkedIn ids are stable, so they win there.
+  if (platform === 'linkedin') {
+    const linkedInId = linkedInJobIdFromUrl(url);
+    if (linkedInId) return `li:${linkedInId}`;
+  }
+  if (title && org && title !== 'unknown' && org !== 'unknown') return `job:${title}|${org}`;
+  if (url) {
+    const normalized = normalizeJobUrl(url);
+    const jobId = naukriJobIdFromUrl(normalized);
+    if (jobId) return `id:${jobId}`;
+    if (normalized && !normalized.includes('/undefined')) return `url:${normalized}`;
+  }
+  if (title) return `title:${title}`;
+  return null;
+}
+
+/** A confirmed apply outranks everything — a later weaker signal must not overwrite it. */
+const OUTCOME_RANK: Record<RunOutcome, number> = { skipped: 1, failed: 2, applied: 3 };
+
+/** Older runs (and states saved by a previous build) carry counts but no ledger. */
+function ensureOutcomeLedger(state: CountableRunState): Record<string, RunOutcome> {
+  if (!state.counts) state.counts = { applied: 0, skipped: 0, failed: 0 };
+  if (state.countedOutcomes) return state.countedOutcomes;
+  const ledger: Record<string, RunOutcome> = {};
+  let n = 0;
+  for (const outcome of ['applied', 'skipped', 'failed'] as RunOutcome[]) {
+    for (let i = 0; i < (state.counts[outcome] ?? 0); i++) {
+      ledger[`legacy:${outcome}:${n++}`] = outcome;
+    }
+  }
+  state.countedOutcomes = ledger;
+  return ledger;
+}
+
+function recomputeCountsFromLedger(state: CountableRunState): void {
+  const tally = { applied: 0, skipped: 0, failed: 0 };
+  for (const outcome of Object.values(ensureOutcomeLedger(state))) {
+    if (outcome in tally) tally[outcome]++;
+  }
+  state.counts = tally;
+}
+
+/** Records the outcome of one job. Repeat calls for the same job never inflate the totals. */
+function countJobOutcome(
+  state: CountableRunState,
+  outcome: RunOutcome,
+  jobTitle?: string,
+  company?: string,
+  url?: string | null,
+  reason?: string,
+): void {
+  const ledger = ensureOutcomeLedger(state);
+  const key = outcomeLedgerKey(jobTitle, company, url, state.platform)
+    ?? `anon:${Object.keys(ledger).length}`;
+  const previous = ledger[key];
+  if (previous && OUTCOME_RANK[previous] >= OUTCOME_RANK[outcome]) return;
+  ledger[key] = outcome;
+  recomputeCountsFromLedger(state);
+  if (outcome === 'failed') {
+    recordFailedLead(jobTitle, company, reason || 'Application failed', url ?? undefined);
+  }
+  // Push the authoritative tally so the dashboard never has to infer counts from events
+  emitRunCounters(state.counts);
+}
+
+/**
+ * Merges a ledger read back from storage. Passes can overlap after a forced resume, so counts
+ * are unioned rather than overwritten — a stale pass must never lower the totals.
+ */
+function mergeOutcomeLedger(state: CountableRunState, incoming?: Record<string, RunOutcome>): void {
+  const ledger = ensureOutcomeLedger(state);
+  if (incoming) {
+    for (const [key, outcome] of Object.entries(incoming)) {
+      const previous = ledger[key];
+      if (!previous || OUTCOME_RANK[outcome] > OUTCOME_RANK[previous]) ledger[key] = outcome;
+    }
+  }
+  recomputeCountsFromLedger(state);
 }
 
 function isNaukriDetailProcessed(state: NaukriRunState, url: string | undefined | null): boolean {
@@ -683,6 +794,11 @@ function stopForNaukriRateLimit(state: NaukriRunState): void {
 }
 
 /** Skip the current Naukri job and always advance — never reopen the same failing posting. */
+function isFailedNaukriApplication(reason: string): boolean {
+  return /could not (answer|finish|confirm)|apply (button click did not register|did not complete)|error after apply|incomplete application|multiapplyresp.*406|submit.*failed/i
+    .test(reason);
+}
+
 function skipNaukriJobAndAdvance(
   state: NaukriRunState,
   reason: string,
@@ -703,16 +819,19 @@ function skipNaukriJobAndAdvance(
   }
 
   if (!alreadyHandled) {
-    state.counts.skipped++;
+    const outcome: RunOutcome = isFailedNaukriApplication(reason) ? 'failed' : 'skipped';
+    countJobOutcome(state, outcome, state.jobTitle, state.company, listingUrl, reason);
     const isRateLimit = /rate limit/i.test(reason);
     if (isRateLimit) {
       countNaukriRateLimits(state);
     } else {
       clearNaukriConsecutiveRateLimits(state);
     }
-    recordSkippedLead(state.jobTitle, state.company, reason, listingUrl);
+    if (outcome === 'skipped') {
+      recordSkippedLead(state.jobTitle, state.company, reason, listingUrl);
+    }
     emit({
-      status: 'skipped',
+      status: outcome,
       jobTitle: state.jobTitle,
       company: state.company,
       reason,
@@ -876,12 +995,58 @@ function recordAppliedLead(
   });
 }
 
+function recordFailedLead(
+  jobTitle: string | undefined,
+  company: string | undefined,
+  reason: string,
+  listingUrl?: string,
+): void {
+  const state = loadNaukriState();
+  const url = resolveNaukriListingUrl(listingUrl ?? state?.currentDetailUrl ?? window.location.href);
+  const title = jobTitle ?? state?.jobTitle;
+  const org = company ?? state?.company;
+  if (!url && !title && !org) return;
+
+  recordExternalApplyLead({
+    jobTitle: title ?? 'Unknown',
+    company: org ?? 'Unknown',
+    naukriUrl: url || listingUrl || window.location.href,
+    skipReason: reason,
+    sourceType: 'failed',
+    capturedAt: new Date().toISOString(),
+  });
+}
+
+/**
+ * Overlapping passes (forced resumes) can hold different copies of the run state. Folding the
+ * stored ledger in before every write keeps the tally monotonic, so a stale pass can never
+ * erase outcomes another pass already recorded.
+ */
+function persistRunState(state: NaukriRunState | LinkedInRunState, platform: 'naukri' | 'linkedin'): void {
+  try {
+    const raw = sessionStorage.getItem(PENDING_KEY);
+    if (raw) {
+      const previous = JSON.parse(raw) as {
+        runId?: string;
+        countedOutcomes?: Record<string, RunOutcome>;
+      };
+      if (previous?.runId === state.runId && previous.countedOutcomes) {
+        mergeOutcomeLedger(state, previous.countedOutcomes);
+      }
+    }
+  } catch {
+    // Unreadable state — write ours as-is
+  }
+  ensureOutcomeLedger(state);
+  sessionStorage.setItem(PENDING_KEY, JSON.stringify({ ...state, platform }));
+}
+
 function saveNaukriState(state: NaukriRunState): void {
-  sessionStorage.setItem(PENDING_KEY, JSON.stringify({ ...state, platform: 'naukri' as const }));
+  persistRunState(state, 'naukri');
 }
 
 function saveLinkedInState(state: LinkedInRunState): void {
-  sessionStorage.setItem(PENDING_KEY, JSON.stringify({ ...state, platform: 'linkedin' as const }));
+  persistRunState(state, 'linkedin');
 }
 
 function loadNaukriState(): NaukriRunState | null {
@@ -924,6 +1089,7 @@ function loadLinkedInState(): LinkedInRunState | null {
         criteria: parsed.criteria!,
         jobIndex: parsed.jobIndex ?? 0,
         counts: parsed.counts ?? { applied: 0, skipped: 0, failed: 0 },
+        countedOutcomes: parsed.countedOutcomes,
         processedJobKeys: parsed.processedJobKeys ?? [],
       };
     }
@@ -986,7 +1152,7 @@ function emit(event: {
   });
 }
 
-function emitLinkedInCounters(counts: { applied: number; skipped: number; failed: number }): void {
+function emitRunCounters(counts: { applied: number; skipped: number; failed: number }): void {
   if (!currentRunId || !isTopWindow()) return;
   lastProgressAt = Date.now();
   safeRuntimeSend({
@@ -1030,6 +1196,31 @@ function startStallWatchdog(): void {
   }, 15000);
 }
 
+/**
+ * The caller may hold an older state object than the one on disk (forced resumes overlap
+ * passes), so the summary is built from the union of both ledgers.
+ */
+function reconcileFinalCounts(
+  counts: { applied: number; skipped: number; failed: number },
+): { applied: number; skipped: number; failed: number } {
+  const merged: CountableRunState = {
+    counts: { applied: 0, skipped: 0, failed: 0 },
+    countedOutcomes: {},
+  };
+  for (const stored of [loadNaukriState(), loadLinkedInState()]) {
+    if (stored && stored.runId === currentRunId) {
+      mergeOutcomeLedger(merged, ensureOutcomeLedger(stored));
+    }
+  }
+  const { applied, skipped, failed } = merged.counts;
+  if (applied + skipped + failed === 0) return counts;
+  return {
+    applied: Math.max(counts.applied, applied),
+    skipped: Math.max(counts.skipped, skipped),
+    failed: Math.max(counts.failed, failed),
+  };
+}
+
 function finish(counts: { applied: number; skipped: number; failed: number }): void {
   // Prefer top-frame sessionStorage so same-origin iframes share one finish marker.
   let store: Storage = sessionStorage;
@@ -1039,6 +1230,10 @@ function finish(counts: { applied: number; skipped: number; failed: number }): v
     // cross-origin iframe — use this frame's sessionStorage
   }
   const finishKey = `job-autoapply-finished-${currentRunId || 'none'}`;
+  // A finished run must never apply again: passes that overlap after a forced resume are still
+  // mid-loop here, and without a hard stop they kept applying past the target.
+  stopRequested = true;
+  sessionStorage.setItem(STOP_KEY, '1');
   if (store.getItem(finishKey) === '1') {
     sessionStorage.removeItem(PENDING_KEY);
     sessionStorage.removeItem(EXEC_KEY);
@@ -1048,7 +1243,7 @@ function finish(counts: { applied: number; skipped: number; failed: number }): v
   store.setItem(finishKey, '1');
   safeRuntimeSend({
     type: 'REPORT_AUTOMATION_EVENT',
-    payload: { type: 'RUN_SUMMARY', runId: currentRunId, ...counts },
+    payload: { type: 'RUN_SUMMARY', runId: currentRunId, ...reconcileFinalCounts(counts) },
   });
   sessionStorage.removeItem(PENDING_KEY);
   sessionStorage.removeItem(EXEC_KEY);
@@ -1239,7 +1434,7 @@ async function captureNaukriCompanySiteApply(
 
   markJobProcessed(state, currentUrl);
   markJobProcessed(state, state.currentDetailUrl);
-  state.counts.skipped++;
+  countJobOutcome(state, 'skipped', jobTitle, company, currentUrl);
   state.jobIndex += 1;
   state.phase = 'list';
   state.jobTitle = undefined;
@@ -3484,6 +3679,75 @@ function proficiencyRating(profile: Profile): string {
   return String(Math.min(9, Math.max(6, Math.round(5 + years / 2))));
 }
 
+/** Accepts a bare handle, a www link or a full URL and returns something a form will accept. */
+function toProfileUrl(value: string | undefined, base: string): string | undefined {
+  const raw = (value ?? '').trim();
+  if (!raw) return undefined;
+  if (/^https?:\/\//i.test(raw)) return raw;
+  if (/^www\./i.test(raw) || /^[a-z0-9-]+\.[a-z]{2,}/i.test(raw)) return `https://${raw}`;
+  return `${base}${raw.replace(/^\/+/, '')}`;
+}
+
+let signedInLinkedInUrl: string | null | undefined;
+
+/**
+ * The signed-in member's own profile URL, read off the page. Used when the saved profile has no
+ * LinkedIn URL, so a required "LinkedIn*" field still gets a real answer instead of blocking.
+ */
+function getSignedInLinkedInProfileUrl(): string | undefined {
+  if (signedInLinkedInUrl !== undefined) return signedInLinkedInUrl ?? undefined;
+  signedInLinkedInUrl = null;
+  if (!window.location.hostname.includes('linkedin.com')) return undefined;
+
+  const candidates = Array.from(
+    document.querySelectorAll<HTMLAnchorElement>(
+      '.global-nav__me a[href*="/in/"], .global-nav a[href*="/in/"], '
+      + 'a.profile-rail-card__actor-link[href*="/in/"], '
+      + 'a[data-control-name="identity_welcome_message"][href*="/in/"], '
+      + 'a[href*="/in/"][class*="profile-card"]',
+    ),
+  );
+  for (const anchor of candidates) {
+    const match = (anchor.getAttribute('href') || '').match(/\/in\/([^/?#]+)/);
+    if (match?.[1] && match[1] !== 'undefined') {
+      signedInLinkedInUrl = `https://www.linkedin.com/in/${match[1]}`;
+      return signedInLinkedInUrl;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * "LinkedIn*", "LinkedIn profile URL", "GitHub", "Portfolio / website" — required link fields
+ * that used to stay empty, which failed validation and got the whole application skipped.
+ */
+function profileLinkAnswer(question: string, profile: Profile): string | undefined {
+  const q = question.toLowerCase().replace(/[*:]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!q) return undefined;
+  // "Are you following us on LinkedIn?" is a yes/no question, not a request for the link
+  if (/^(are|do|have|will|can|would|did) you\b/.test(q)) return undefined;
+
+  const wantsLink = /\b(url|link|profile|handle|address|page|id)\b/.test(q);
+
+  if (/linked\s?-?in/.test(q)) {
+    if (!wantsLink && !/^linked\s?-?in$/.test(q)) return undefined;
+    return toProfileUrl(profile.linkedinProfileUrl, 'https://www.linkedin.com/in/')
+      ?? getSignedInLinkedInProfileUrl();
+  }
+
+  if (/\bgit\s?hub\b/.test(q)) {
+    return toProfileUrl(profile.portfolioUrl, 'https://github.com/');
+  }
+
+  if (/portfolio|personal (website|site)|your website|web ?site|blog/.test(q)) {
+    return toProfileUrl(profile.portfolioUrl, 'https://')
+      ?? toProfileUrl(profile.linkedinProfileUrl, 'https://www.linkedin.com/in/')
+      ?? getSignedInLinkedInProfileUrl();
+  }
+
+  return undefined;
+}
+
 function mapChatbotAnswer(question: string, profile: Profile): string | undefined {
   let raw = (question ?? '').replace(/\s+/g, ' ').trim();
   if (!raw) return undefined;
@@ -3501,6 +3765,9 @@ function mapChatbotAnswer(question: string, profile: Profile): string | undefine
   // Bare field prompts with options below ("Salutation", "Gender")
   if (/^salutation\s*[:?]?$/.test(q) || /\bsalutation\b|\btitle \(mr|prefix\b/.test(q)) return 'Mr';
   if (/^gender\s*[:?]?$/.test(q)) return 'Male';
+
+  const link = profileLinkAnswer(raw, profile);
+  if (link) return link;
 
   if (/date of birth|\bdob\b|birth date|birthdate|when were you born/.test(q)) {
     return formatDateOfBirth(profile.dateOfBirth, raw);
@@ -4486,12 +4753,16 @@ async function finalizeNaukriApplication(state: NaukriRunState): Promise<void> {
 
   clearNaukriConsecutiveRateLimits(state);
   markJobProcessed(state, url);
-  state.counts.applied++;
+  countJobOutcome(state, 'applied', state.jobTitle, state.company, url);
   recordAppliedLead(state.jobTitle, state.company, url);
   emit({ status: 'applied', jobTitle: state.jobTitle, company: state.company });
   saveNaukriState(state);
 
   if (hasReachedApplyCap(state)) {
+    emit({
+      status: 'searching',
+      reason: `Target reached (${state.counts.applied}/${state.criteria.dailyApplicationCap} applied)`,
+    });
     finish(state.counts);
     return;
   }
@@ -5374,7 +5645,7 @@ async function applyOnNaukriDetailPage(profile: Profile, state: NaukriRunState):
     }
 
     markJobProcessed(state, listingUrl);
-    state.counts.skipped++;
+    countJobOutcome(state, 'skipped', jobTitle, company, listingUrl);
     recordSkippedLead(jobTitle, company, 'Apply now button not found', listingUrl);
     emit({ status: 'skipped', jobTitle, company, reason: 'Apply now button not found — skipping' });
     returnToNaukriSearch(state, state.jobIndex + 1);
@@ -5717,7 +5988,7 @@ async function runNaukri(profile: Profile, criteria: SearchCriteria): Promise<vo
       const key = naukriJobKey(jobTitle, company);
       if (!state.processedJobKeys) state.processedJobKeys = [];
       if (key !== '|' && !state.processedJobKeys.includes(key)) state.processedJobKeys.push(key);
-      state.counts.skipped++;
+      countJobOutcome(state, 'skipped', jobTitle, company, normalizedDetailUrl || window.location.href);
       recordSkippedLead(jobTitle, company, 'already applied (listing badge)', normalizeJobUrl(window.location.href));
       emit({ status: 'skipped', jobTitle, company, reason: 'already applied' });
       state.jobIndex = i + 1;
@@ -5726,7 +5997,7 @@ async function runNaukri(profile: Profile, criteria: SearchCriteria): Promise<vo
     }
 
     if (!detailUrl || !normalizedDetailUrl) {
-      state.counts.skipped++;
+      countJobOutcome(state, 'skipped', jobTitle, company, null);
       if (!state.processedJobKeys) state.processedJobKeys = [];
       const key = naukriJobKey(jobTitle, company);
       if (key !== '|' && !state.processedJobKeys.includes(key)) state.processedJobKeys.push(key);
@@ -5750,7 +6021,7 @@ async function runNaukri(profile: Profile, criteria: SearchCriteria): Promise<vo
       if (!isNaukriJobHandled(state, normalizedDetailUrl, jobTitle, company)) {
         markJobProcessed(state, normalizedDetailUrl);
         if (!skipAlreadyRecorded) {
-          state.counts.skipped++;
+          countJobOutcome(state, 'skipped', jobTitle, company, normalizedDetailUrl);
           const attemptReason = `Job page never became applyable after ${openCount} opens — skipped`;
           recordSkippedLead(jobTitle, company, attemptReason, normalizedDetailUrl);
           sessionStorage.setItem(`job-autoapply-skip-recorded-${normalizedDetailUrl}`, '1');
@@ -6734,6 +7005,14 @@ function isNumericLinkedInField(input: HTMLInputElement, label: string, hint: st
   return false;
 }
 
+/**
+ * Values LinkedIn owns (verified email, phone country code, uploaded resume) are already
+ * correct — replacing them with profile text only breaks the form.
+ */
+function isLinkedInProtectedPrefill(label: string): boolean {
+  return /country code|phone country|email address|^email$|resume|^cv$|upload/i.test(label.trim());
+}
+
 function fillLinkedInSelect(select: HTMLSelectElement, label: string, profile: Profile): boolean {
   const options = Array.from(select.options).filter((opt) => {
     const text = normalizeText(opt.textContent ?? '');
@@ -6742,7 +7021,10 @@ function fillLinkedInSelect(select: HTMLSelectElement, label: string, profile: P
   if (options.length === 0) return false;
 
   const current = normalizeText(select.selectedOptions[0]?.textContent ?? '');
-  if (current && !current.startsWith('select an option') && current !== 'select') return false;
+  const hasRealSelection = Boolean(current)
+    && !current.startsWith('select an option')
+    && current !== 'select';
+  if (hasRealSelection && isLinkedInProtectedPrefill(label)) return false;
 
   const getText = (opt: HTMLOptionElement) => opt.textContent ?? '';
   const desired = mapChatbotAnswer(label, profile);
@@ -6752,15 +7034,20 @@ function fillLinkedInSelect(select: HTMLSelectElement, label: string, profile: P
     options.find((opt) => predicate(normalizeText(opt.textContent ?? '')));
 
   let target: HTMLOptionElement | undefined;
+  // Only an answer derived from the saved profile may replace an existing selection —
+  // generic guesses must never overwrite something already chosen.
+  let fromProfile = false;
 
   // Preferred cities / locations — fuzzy match against profile city
   if (isLinkedInCityQuestion(label)) {
     target = pickLinkedInCityOption(options, getText, profile);
+    fromProfile = Boolean(target);
   }
 
   // Notice period / availability dropdowns
   if (!target && isLinkedInNoticeAvailabilityQuestion(label)) {
     target = pickLinkedInNoticePeriodOption(options, getText, profile);
+    fromProfile = Boolean(target);
   }
 
   if (!target && wanted) {
@@ -6769,11 +7056,13 @@ function fillLinkedInSelect(select: HTMLSelectElement, label: string, profile: P
     if (!target && /location|city|cities|reside|based/i.test(label)) {
       target = pickLinkedInCityOption(options, getText, profile);
     }
+    fromProfile = Boolean(target);
   }
   if (!target) {
     const yesNo = linkedInYesNoAnswer(label, profile);
     if (yesNo) {
       target = pick((text) => text === yesNo) ?? pick((text) => text.startsWith(yesNo));
+      fromProfile = Boolean(target);
     }
   }
   // Relocate / work permit style questions that didn't match linkedInYesNoAnswer
@@ -6784,6 +7073,7 @@ function fillLinkedInSelect(select: HTMLSelectElement, label: string, profile: P
         ? profile.workAuthorization !== 'No'
         : profile.willingToRelocate !== false;
       target = pick((text) => text === (preferYes ? 'yes' : 'no'));
+      fromProfile = Boolean(target);
     }
   }
   // Binary Yes/No dropdowns (privacy / agree / generic) → Yes
@@ -6796,6 +7086,8 @@ function fillLinkedInSelect(select: HTMLSelectElement, label: string, profile: P
     }
   }
   if (!target) return false;
+  if (hasRealSelection && !fromProfile) return false;
+  if (hasRealSelection && normalizeText(target.textContent ?? '') === current) return false;
 
   const proto = HTMLSelectElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
@@ -6824,14 +7116,17 @@ async function fillLinkedInCustomDropdowns(modal: HTMLElement, profile: Profile)
         .trim()
       || normalizeText(group?.textContent ?? '').slice(0, 200);
     const current = normalizeText(trigger.textContent ?? '');
-    // Skip triggers that already show a real selection (not the placeholder)
-    if (
-      current
+    const hasRealSelection = Boolean(current)
       && !current.includes('select an option')
       && current !== 'select'
-      && current !== 'required'
-    ) {
-      continue;
+      && current !== 'required';
+    // A dropdown that already shows an answer is only reopened when the saved profile has a
+    // different answer for it — otherwise the existing choice stands.
+    if (hasRealSelection) {
+      if (isLinkedInProtectedPrefill(label)) continue;
+      const preferredRaw = linkedInYesNoAnswer(label, profile) ?? mapChatbotAnswer(label, profile);
+      const preferred = preferredRaw ? normalizeText(preferredRaw) : '';
+      if (!preferred || current === preferred || current.includes(preferred)) continue;
     }
 
     forceClick(trigger);
@@ -6923,7 +7218,7 @@ function clickLinkedInRadio(radio: HTMLInputElement): void {
 function fillLinkedInRadioGroup(group: HTMLElement, label: string, profile: Profile): boolean {
   const radios = Array.from(group.querySelectorAll<HTMLInputElement>('input[type="radio"]'));
   if (radios.length === 0) return false;
-  if (radios.some((r) => r.checked)) return false;
+  const checked = radios.find((r) => r.checked);
 
   // Prefer the real question (legend) over a polluted "Yes" option label
   const question = (() => {
@@ -6942,19 +7237,22 @@ function fillLinkedInRadioGroup(group: HTMLElement, label: string, profile: Prof
   );
 
   let target: HTMLInputElement | undefined;
+  // Only a profile-derived answer may replace an option the page already selected.
+  let fromProfile = false;
 
   // Notice period / availability radios (Available now, One month, …)
   if (isLinkedInNoticeAvailabilityQuestion(question) || looksLikeNotice) {
     target = pickLinkedInNoticePeriodOption(radios, getText, profile);
+    fromProfile = Boolean(target);
   }
 
   if (!target) {
     const desired = mapChatbotAnswer(question, profile);
     const wanted = desired ? normalizeText(desired) : '';
-    const yesNo = linkedInYesNoAnswer(question, profile)
-      ?? (/comfortable|hybrid|commut|office|willing|authorized|relocat|agree|work permit/i.test(question)
-        ? 'yes' as const
-        : undefined);
+    const profileYesNo = linkedInYesNoAnswer(question, profile);
+    const guessedYes = /comfortable|hybrid|commut|office|willing|authorized|relocat|agree|work permit/i.test(question)
+      ? 'yes' as const
+      : undefined;
 
     const byLabel = (needle: string) => radios.find((r) => {
       const text = normalizeText(getRadioLabel(r));
@@ -6963,12 +7261,16 @@ function fillLinkedInRadioGroup(group: HTMLElement, label: string, profile: Prof
 
     const yesNoOnly = texts.length >= 2 && texts.every((t) => t === 'yes' || t === 'no' || t === 'true' || t === 'false');
 
-    target = (wanted ? byLabel(wanted) : undefined)
-      ?? (yesNo ? byLabel(yesNo) : undefined)
-      ?? (yesNoOnly ? byLabel('yes') ?? byLabel('true') : undefined);
+    target = (wanted ? byLabel(wanted) : undefined) ?? (profileYesNo ? byLabel(profileYesNo) : undefined);
+    fromProfile = Boolean(target);
+    if (!target) {
+      target = (guessedYes ? byLabel(guessedYes) : undefined)
+        ?? (yesNoOnly ? byLabel('yes') ?? byLabel('true') : undefined);
+    }
   }
 
   if (!target) return false;
+  if (checked && (target === checked || !fromProfile)) return false;
   clickLinkedInRadio(target);
   return true;
 }
@@ -6992,6 +7294,9 @@ function fillLinkedInCheckboxes(modal: HTMLElement): void {
     forceClick(clickTarget);
   }
 }
+
+/** Pause between two questions so LinkedIn's validation settles before the next one is touched. */
+const LINKEDIN_FIELD_PACE_MS = 450;
 
 async function fillLinkedInEasyApplyFields(profile: Profile): Promise<boolean> {
   const modal = getLinkedInEasyApplyModal();
@@ -7020,6 +7325,7 @@ async function fillLinkedInEasyApplyFields(profile: Profile): Promise<boolean> {
           status: 'searching',
           reason: `LinkedIn: "${label.slice(0, 70)}" → ${(el as HTMLSelectElement).selectedOptions[0]?.textContent?.trim() ?? ''}`,
         });
+        await sleep(LINKEDIN_FIELD_PACE_MS);
       }
       continue;
     }
@@ -7037,18 +7343,24 @@ async function fillLinkedInEasyApplyFields(profile: Profile): Promise<boolean> {
           status: 'searching',
           reason: `LinkedIn: "${(label || 'Yes/No').slice(0, 70)}" → ${normalizeText(chosen ? getRadioLabel(chosen) : 'yes')}`,
         });
+        await sleep(LINKEDIN_FIELD_PACE_MS);
       }
       continue;
     }
 
     const input = el as HTMLInputElement | HTMLTextAreaElement;
     const current = input.value.trim();
-    // Keep valid answers; only rewrite when LinkedIn flagged the field
-    if (current && !hasError) continue;
 
+    // A saved answer always wins over whatever LinkedIn prefilled; a generic fallback (cover
+    // letter blob) only fills a field that is still empty.
     let value: string | undefined;
+    let isFallback = false;
     if (tag === 'textarea') {
-      value = mapChatbotAnswer(label, profile) ?? profile.coverLetterTemplate;
+      value = mapChatbotAnswer(label, profile);
+      if (!value) {
+        value = profile.coverLetterTemplate;
+        isFallback = true;
+      }
     } else if (isNumericLinkedInField(input as HTMLInputElement, label, hint)) {
       value = linkedInNumericAnswer(label, hint, profile);
     } else if (type === 'email') {
@@ -7062,15 +7374,27 @@ async function fillLinkedInEasyApplyFields(profile: Profile): Promise<boolean> {
     }
 
     if (!value) continue;
-    if (value === current) continue;
+    if (normalizeText(value) === normalizeText(current)) continue;
+    if (current && (isFallback || isLinkedInProtectedPrefill(label)) && !hasError) continue;
 
+    if (current) {
+      // Controlled inputs ignore a plain value swap unless the old text is cleared first
+      try {
+        input.focus();
+        input.select?.();
+      } catch {
+        // ignore
+      }
+      setReactInputValue(input, '');
+      await sleep(80);
+    }
     setReactInputValue(input, value);
     filled = true;
     emit({
       status: 'searching',
       reason: `LinkedIn: "${label.slice(0, 70)}" → ${value}`,
     });
-    await sleep(120);
+    await sleep(LINKEDIN_FIELD_PACE_MS);
 
     // Typeahead fields (city) need a suggestion committed
     if (/city|location/.test(label.toLowerCase())) {
@@ -7079,6 +7403,7 @@ async function fillLinkedInEasyApplyFields(profile: Profile): Promise<boolean> {
         '.basic-typeahead__triggered-content [role="option"], [role="listbox"] [role="option"]',
       ) as HTMLElement | null;
       if (option && isVisible(option)) forceClick(option);
+      await sleep(250);
     }
   }
 
@@ -7097,9 +7422,11 @@ async function fillLinkedInStepUntilValid(
     if (pass === 0 && filled) {
       emit({ status: 'searching', jobTitle, company, reason: 'Answering Easy Apply questions...' });
     }
-    await sleep(400);
+    // Give the form time to re-validate every answered question before judging the step
+    await sleep(900);
     if (!linkedInModalHasFieldErrors()) return true;
     if (!filled && pass > 0) break;
+    await sleep(400);
   }
   return !linkedInModalHasFieldErrors();
 }
@@ -7225,10 +7552,10 @@ async function handleLinkedInCompanySiteApply(
   // Always record the lead immediately so CSV/email include it even if URL capture is slow
   recordExternalApplyLead(lead);
 
-  state.counts.skipped++;
+  countJobOutcome(state, 'skipped', jobTitle, company, jobUrl);
   state.jobIndex += 1;
   saveLinkedInState(state);
-  emitLinkedInCounters(state.counts);
+  emitRunCounters(state.counts);
   releasePageClaim();
   sessionStorage.removeItem(EXEC_KEY);
 
@@ -7307,7 +7634,7 @@ async function runLinkedIn(profile: Profile, criteria: SearchCriteria): Promise<
       status: 'searching',
       reason: `Daily cap reached (${state.counts.applied}/${state.criteria.dailyApplicationCap})`,
     });
-    emitLinkedInCounters(state.counts);
+    emitRunCounters(state.counts);
     finish(state.counts);
     return;
   }
@@ -7338,7 +7665,8 @@ async function runLinkedIn(profile: Profile, criteria: SearchCriteria): Promise<
   for (let i = state.jobIndex; i < cards.length && stillThisPass(); i++) {
     // Reload counts from storage in case another pass updated them
     const fresh = loadLinkedInState();
-    if (fresh?.counts) state.counts = fresh.counts;
+    // Union the ledgers — replacing counts let a stale pass undo applies already recorded
+    if (fresh) mergeOutcomeLedger(state, ensureOutcomeLedger(fresh));
     if (fresh?.processedJobKeys) state.processedJobKeys = fresh.processedJobKeys;
 
     if (state.counts.applied >= state.criteria.dailyApplicationCap) break;
@@ -7355,13 +7683,13 @@ async function runLinkedIn(profile: Profile, criteria: SearchCriteria): Promise<
     }
 
     if ((card.textContent ?? '').includes('Applied')) {
-      state.counts.skipped++;
+      countJobOutcome(state, 'skipped', jobTitle, company, listingUrl);
       state.processedJobKeys.push(key);
       state.jobIndex = i + 1;
       recordSkippedLead(jobTitle, company, 'already applied', listingUrl);
       emit({ status: 'skipped', jobTitle, company, reason: 'already applied' });
       saveLinkedInState(state);
-      emitLinkedInCounters(state.counts);
+      emitRunCounters(state.counts);
       continue;
     }
 
@@ -7430,13 +7758,13 @@ async function runLinkedIn(profile: Profile, criteria: SearchCriteria): Promise<
         return;
       }
 
-      state.counts.skipped++;
+      countJobOutcome(state, 'skipped', jobTitle, company, listingUrl);
       state.processedJobKeys.push(key);
       state.jobIndex = i + 1;
       recordSkippedLead(jobTitle, company, 'No Apply button found', listingUrl);
       emit({ status: 'skipped', jobTitle, company, reason: 'No Apply button found' });
       saveLinkedInState(state);
-      emitLinkedInCounters(state.counts);
+      emitRunCounters(state.counts);
       continue;
     }
 
@@ -7466,13 +7794,13 @@ async function runLinkedIn(profile: Profile, criteria: SearchCriteria): Promise<
     if (!getLinkedInEasyApplyModal()) {
       // Only count applied when THIS job's detail pane shows Applied — not a leftover modal
       if (linkedInTopCardShowsApplied()) {
-        state.counts.skipped++;
+        countJobOutcome(state, 'skipped', jobTitle, company, listingUrl);
         state.processedJobKeys.push(key);
         state.jobIndex = i + 1;
         recordSkippedLead(jobTitle, company, 'already applied', listingUrl);
         emit({ status: 'skipped', jobTitle, company, reason: 'already applied' });
         saveLinkedInState(state);
-        emitLinkedInCounters(state.counts);
+        emitRunCounters(state.counts);
         continue;
       }
 
@@ -7489,13 +7817,13 @@ async function runLinkedIn(profile: Profile, criteria: SearchCriteria): Promise<
         }
         if (!getLinkedInEasyApplyModal()) {
           if (linkedInTopCardShowsApplied()) {
-            state.counts.skipped++;
+            countJobOutcome(state, 'skipped', jobTitle, company, listingUrl);
             state.processedJobKeys.push(key);
             state.jobIndex = i + 1;
             recordSkippedLead(jobTitle, company, 'already applied', listingUrl);
             emit({ status: 'skipped', jobTitle, company, reason: 'already applied' });
             saveLinkedInState(state);
-            emitLinkedInCounters(state.counts);
+            emitRunCounters(state.counts);
             continue;
           }
           const offsite = again.external && isLinkedInOffsiteApplyControl(again.external)
@@ -7507,13 +7835,19 @@ async function runLinkedIn(profile: Profile, criteria: SearchCriteria): Promise<
             await handleLinkedInCompanySiteApply(state, jobTitle, company, offsite, listingUrl);
             return;
           }
-          state.counts.skipped++;
+          countJobOutcome(
+            state,
+            'failed',
+            jobTitle,
+            company,
+            listingUrl,
+            'Easy Apply modal did not open',
+          );
           state.processedJobKeys.push(key);
           state.jobIndex = i + 1;
-          recordSkippedLead(jobTitle, company, 'Easy Apply modal did not open', listingUrl);
-          emit({ status: 'skipped', jobTitle, company, reason: 'Easy Apply modal did not open' });
+          emit({ status: 'failed', jobTitle, company, reason: 'Easy Apply modal did not open' });
           saveLinkedInState(state);
-          emitLinkedInCounters(state.counts);
+          emitRunCounters(state.counts);
           continue;
         }
       }
@@ -7525,9 +7859,9 @@ async function runLinkedIn(profile: Profile, criteria: SearchCriteria): Promise<
     state.jobIndex = i + 1;
 
     if (outcome === 'applied') {
-      state.counts.applied++;
+      countJobOutcome(state, 'applied', jobTitle, company, listingUrl);
       saveLinkedInState(state);
-      emitLinkedInCounters(state.counts);
+      emitRunCounters(state.counts);
       recordExternalApplyLead({
         jobTitle,
         company,
@@ -7547,28 +7881,42 @@ async function runLinkedIn(profile: Profile, criteria: SearchCriteria): Promise<
         return;
       }
     } else if (outcome === 'skipped') {
-      state.counts.skipped++;
       // If top card already says Applied, record as already applied (not a new apply)
       if (linkedInTopCardShowsApplied()) {
+        countJobOutcome(state, 'skipped', jobTitle, company, listingUrl);
         recordSkippedLead(jobTitle, company, 'already applied', listingUrl);
         emit({ status: 'skipped', jobTitle, company, reason: 'already applied' });
       } else {
-        recordSkippedLead(jobTitle, company, 'could not complete Easy Apply form', listingUrl);
-        emit({ status: 'skipped', jobTitle, company, reason: 'could not complete Easy Apply form' });
+        countJobOutcome(
+          state,
+          'failed',
+          jobTitle,
+          company,
+          listingUrl,
+          'Could not complete Easy Apply form',
+        );
+        emit({ status: 'failed', jobTitle, company, reason: 'could not complete Easy Apply form' });
       }
-      emitLinkedInCounters(state.counts);
+      emitRunCounters(state.counts);
     } else {
       if (linkedInTopCardShowsApplied()) {
         // Submitted earlier / already done — do not count as a new apply
-        state.counts.skipped++;
+        countJobOutcome(state, 'skipped', jobTitle, company, listingUrl);
         recordSkippedLead(jobTitle, company, 'already applied', listingUrl);
         emit({ status: 'skipped', jobTitle, company, reason: 'already applied' });
-        emitLinkedInCounters(state.counts);
+        emitRunCounters(state.counts);
         await dismissLinkedInPostApplyOverlay();
       } else {
-        state.counts.failed++;
+        countJobOutcome(
+          state,
+          'failed',
+          jobTitle,
+          company,
+          listingUrl,
+          'Submit confirmation not detected',
+        );
         emit({ status: 'failed', jobTitle, company, reason: 'submit confirmation not detected' });
-        emitLinkedInCounters(state.counts);
+        emitRunCounters(state.counts);
         await abandonLinkedInEasyApply();
       }
     }
@@ -7591,7 +7939,7 @@ async function runLinkedIn(profile: Profile, criteria: SearchCriteria): Promise<
       status: 'searching',
       reason: `Daily cap reached (${state.counts.applied}/${state.criteria.dailyApplicationCap})`,
     });
-    emitLinkedInCounters(state.counts);
+    emitRunCounters(state.counts);
     finish(state.counts);
     return;
   }
@@ -7965,7 +8313,13 @@ async function resumePendingRun(_force = false): Promise<void> {
           }
           if (outcome === 'already') {
             markJobProcessed(naukriState, naukriState.currentDetailUrl ?? window.location.href);
-            naukriState.counts.skipped++;
+            countJobOutcome(
+              naukriState,
+              'skipped',
+              naukriState.jobTitle,
+              naukriState.company,
+              naukriState.currentDetailUrl ?? window.location.href,
+            );
             recordSkippedLead(
               naukriState.jobTitle,
               naukriState.company,
@@ -7990,7 +8344,13 @@ async function resumePendingRun(_force = false): Promise<void> {
         }
 
         markJobProcessed(naukriState, naukriState.currentDetailUrl ?? window.location.href);
-        naukriState.counts.skipped++;
+        countJobOutcome(
+          naukriState,
+          'skipped',
+          naukriState.jobTitle,
+          naukriState.company,
+          naukriState.currentDetailUrl ?? window.location.href,
+        );
         recordSkippedLead(
           naukriState.jobTitle,
           naukriState.company,
@@ -8037,7 +8397,13 @@ async function resumePendingRun(_force = false): Promise<void> {
         if (outcome === 'applied' || outcome === 'already') {
           if (outcome === 'already') {
             markJobProcessed(naukriState, naukriState.currentDetailUrl ?? window.location.href);
-            naukriState.counts.skipped++;
+            countJobOutcome(
+              naukriState,
+              'skipped',
+              naukriState.jobTitle,
+              naukriState.company,
+              naukriState.currentDetailUrl ?? window.location.href,
+            );
             recordSkippedLead(
               naukriState.jobTitle,
               naukriState.company,
@@ -8076,7 +8442,24 @@ async function resumePendingRun(_force = false): Promise<void> {
         returnToNaukriSearch(naukriState, naukriState.jobIndex + 1);
       }
     } catch (err) {
-      emit({ status: 'failed', reason: (err as Error).message });
+      const reason = (err as Error).message;
+      if (naukriState.currentDetailUrl || naukriState.jobTitle || naukriState.company) {
+        countJobOutcome(
+          naukriState,
+          'failed',
+          naukriState.jobTitle,
+          naukriState.company,
+          naukriState.currentDetailUrl,
+          reason,
+        );
+        saveNaukriState(naukriState);
+      }
+      emit({
+        status: 'failed',
+        jobTitle: naukriState.jobTitle,
+        company: naukriState.company,
+        reason,
+      });
       finish(naukriState.counts);
     } finally {
       automationActive = false;
@@ -8940,14 +9323,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sessionStorage.setItem(`job-autoapply-skip-recorded-${normalized}`, '1');
         sessionStorage.removeItem(`job-autoapply-bounce-${state.runId}-${normalized}`);
       }
-      state.counts.skipped++;
+      countJobOutcome(state, 'skipped', state.jobTitle, state.company, target);
       state.phase = 'list';
       state.currentDetailUrl = undefined;
       state.jobTitle = undefined;
       state.company = undefined;
       state.jobIndex += 1;
       saveNaukriState(state);
-      emitLinkedInCounters(state.counts);
+      emitRunCounters(state.counts);
     }
     clearNaukriNavIntent();
     sessionStorage.removeItem(`job-autoapply-post-apply-${currentRunId ?? 'none'}`);
